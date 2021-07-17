@@ -1,41 +1,68 @@
-// Copyright 2015 The go-ethereum Authors
-// This file is part of the go-ethereum library.
-//
-// The go-ethereum library is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Lesser General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// The go-ethereum library is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-// GNU Lesser General Public License for more details.
-//
-// You should have received a copy of the GNU Lesser General Public License
-// along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
+// Copyright 2015 Jeffrey Wilcke, Felix Lange, Gustav Simonsson. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be found in
+// the LICENSE file.
 
 package secp256k1
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/hex"
+	"io"
 	"testing"
-
-	"github.com/ethereum/go-ethereum/crypto/randentropy"
 )
 
 const TestCount = 1000
 
-func TestPrivkeyGenerate(t *testing.T) {
-	_, seckey := GenerateKeyPair()
-	if err := VerifySeckeyValidity(seckey); err != nil {
-		t.Errorf("seckey not valid: %s", err)
+func generateKeyPair() (pubkey, privkey []byte) {
+	key, err := ecdsa.GenerateKey(S256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	pubkey = elliptic.Marshal(S256(), key.X, key.Y)
+
+	privkey = make([]byte, 32)
+	blob := key.D.Bytes()
+	copy(privkey[32-len(blob):], blob)
+
+	return pubkey, privkey
+}
+
+func csprngEntropy(n int) []byte {
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
+		panic("reading from crypto/rand failed: " + err.Error())
+	}
+	return buf
+}
+
+func randSig() []byte {
+	sig := csprngEntropy(65)
+	sig[32] &= 0x70
+	sig[64] %= 4
+	return sig
+}
+
+// tests for malleability
+// highest bit of signature ECDSA s value must be 0, in the 33th byte
+func compactSigCheck(t *testing.T, sig []byte) {
+	var b = int(sig[32])
+	if b < 0 {
+		t.Errorf("highest bit is negative: %d", b)
+	}
+	if ((b >> 7) == 1) != ((b & 0x80) == 0x80) {
+		t.Errorf("highest bit: %d bit >> 7: %d", b, b>>7)
+	}
+	if (b & 0x80) == 0x80 {
+		t.Errorf("highest bit: %d bit & 0x80: %d", b, b&0x80)
 	}
 }
 
 func TestSignatureValidity(t *testing.T) {
-	pubkey, seckey := GenerateKeyPair()
-	msg := randentropy.GetEntropyCSPRNG(32)
+	pubkey, seckey := generateKeyPair()
+	msg := csprngEntropy(32)
 	sig, err := Sign(msg, seckey)
 	if err != nil {
 		t.Errorf("signature error: %s", err)
@@ -57,8 +84,8 @@ func TestSignatureValidity(t *testing.T) {
 }
 
 func TestInvalidRecoveryID(t *testing.T) {
-	_, seckey := GenerateKeyPair()
-	msg := randentropy.GetEntropyCSPRNG(32)
+	_, seckey := generateKeyPair()
+	msg := csprngEntropy(32)
 	sig, _ := Sign(msg, seckey)
 	sig[64] = 99
 	_, err := RecoverPubkey(msg, sig)
@@ -68,8 +95,8 @@ func TestInvalidRecoveryID(t *testing.T) {
 }
 
 func TestSignAndRecover(t *testing.T) {
-	pubkey1, seckey := GenerateKeyPair()
-	msg := randentropy.GetEntropyCSPRNG(32)
+	pubkey1, seckey := generateKeyPair()
+	msg := csprngEntropy(32)
 	sig, err := Sign(msg, seckey)
 	if err != nil {
 		t.Errorf("signature error: %s", err)
@@ -83,8 +110,26 @@ func TestSignAndRecover(t *testing.T) {
 	}
 }
 
+func TestSignDeterministic(t *testing.T) {
+	_, seckey := generateKeyPair()
+	msg := make([]byte, 32)
+	copy(msg, "hi there")
+
+	sig1, err := Sign(msg, seckey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig2, err := Sign(msg, seckey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sig1, sig2) {
+		t.Fatal("signatures not equal")
+	}
+}
+
 func TestRandomMessagesWithSameKey(t *testing.T) {
-	pubkey, seckey := GenerateKeyPair()
+	pubkey, seckey := generateKeyPair()
 	keys := func() ([]byte, []byte) {
 		return pubkey, seckey
 	}
@@ -93,7 +138,7 @@ func TestRandomMessagesWithSameKey(t *testing.T) {
 
 func TestRandomMessagesWithRandomKeys(t *testing.T) {
 	keys := func() ([]byte, []byte) {
-		pubkey, seckey := GenerateKeyPair()
+		pubkey, seckey := generateKeyPair()
 		return pubkey, seckey
 	}
 	signAndRecoverWithRandomMessages(t, keys)
@@ -102,7 +147,7 @@ func TestRandomMessagesWithRandomKeys(t *testing.T) {
 func signAndRecoverWithRandomMessages(t *testing.T, keys func() ([]byte, []byte)) {
 	for i := 0; i < TestCount; i++ {
 		pubkey1, seckey := keys()
-		msg := randentropy.GetEntropyCSPRNG(32)
+		msg := csprngEntropy(32)
 		sig, err := Sign(msg, seckey)
 		if err != nil {
 			t.Fatalf("signature error: %s", err)
@@ -129,50 +174,30 @@ func signAndRecoverWithRandomMessages(t *testing.T, keys func() ([]byte, []byte)
 }
 
 func TestRecoveryOfRandomSignature(t *testing.T) {
-	pubkey1, seckey := GenerateKeyPair()
-	msg := randentropy.GetEntropyCSPRNG(32)
-	sig, err := Sign(msg, seckey)
-	if err != nil {
-		t.Errorf("signature error: %s", err)
-	}
+	pubkey1, _ := generateKeyPair()
+	msg := csprngEntropy(32)
 
 	for i := 0; i < TestCount; i++ {
-		sig = randSig()
-		pubkey2, _ := RecoverPubkey(msg, sig)
 		// recovery can sometimes work, but if so should always give wrong pubkey
+		pubkey2, _ := RecoverPubkey(msg, randSig())
 		if bytes.Equal(pubkey1, pubkey2) {
 			t.Fatalf("iteration: %d: pubkey mismatch: do NOT want %x: ", i, pubkey2)
 		}
 	}
-}
-
-func randSig() []byte {
-	sig := randentropy.GetEntropyCSPRNG(65)
-	sig[32] &= 0x70
-	sig[64] %= 4
-	return sig
 }
 
 func TestRandomMessagesAgainstValidSig(t *testing.T) {
-	pubkey1, seckey := GenerateKeyPair()
-	msg := randentropy.GetEntropyCSPRNG(32)
+	pubkey1, seckey := generateKeyPair()
+	msg := csprngEntropy(32)
 	sig, _ := Sign(msg, seckey)
 
 	for i := 0; i < TestCount; i++ {
-		msg = randentropy.GetEntropyCSPRNG(32)
+		msg = csprngEntropy(32)
 		pubkey2, _ := RecoverPubkey(msg, sig)
 		// recovery can sometimes work, but if so should always give wrong pubkey
 		if bytes.Equal(pubkey1, pubkey2) {
 			t.Fatalf("iteration: %d: pubkey mismatch: do NOT want %x: ", i, pubkey2)
 		}
-	}
-}
-
-func TestZeroPrivkey(t *testing.T) {
-	zeroedBytes := make([]byte, 32)
-	err := VerifySeckeyValidity(zeroedBytes)
-	if err == nil {
-		t.Errorf("zeroed bytes should have returned error")
 	}
 }
 
@@ -191,47 +216,23 @@ func TestRecoverSanity(t *testing.T) {
 	}
 }
 
-// tests for malleability
-// highest bit of signature ECDSA s value must be 0, in the 33th byte
-func compactSigCheck(t *testing.T, sig []byte) {
-	var b int = int(sig[32])
-	if b < 0 {
-		t.Errorf("highest bit is negative: %d", b)
-	}
-	if ((b >> 7) == 1) != ((b & 0x80) == 0x80) {
-		t.Errorf("highest bit: %d bit >> 7: %d", b, b>>7)
-	}
-	if (b & 0x80) == 0x80 {
-		t.Errorf("highest bit: %d bit & 0x80: %d", b, b&0x80)
-	}
-}
-
-// godep go test -v -run=XXX -bench=BenchmarkSign
-// add -benchtime=10s to benchmark longer for more accurate average
-
-// to avoid compiler optimizing the benchmarked function call
-var err error
-
 func BenchmarkSign(b *testing.B) {
+	_, seckey := generateKeyPair()
+	msg := csprngEntropy(32)
+	b.ResetTimer()
+
 	for i := 0; i < b.N; i++ {
-		_, seckey := GenerateKeyPair()
-		msg := randentropy.GetEntropyCSPRNG(32)
-		b.StartTimer()
-		_, e := Sign(msg, seckey)
-		err = e
-		b.StopTimer()
+		Sign(msg, seckey)
 	}
 }
 
-//godep go test -v -run=XXX -bench=BenchmarkECRec
 func BenchmarkRecover(b *testing.B) {
+	msg := csprngEntropy(32)
+	_, seckey := generateKeyPair()
+	sig, _ := Sign(msg, seckey)
+	b.ResetTimer()
+
 	for i := 0; i < b.N; i++ {
-		_, seckey := GenerateKeyPair()
-		msg := randentropy.GetEntropyCSPRNG(32)
-		sig, _ := Sign(msg, seckey)
-		b.StartTimer()
-		_, e := RecoverPubkey(msg, sig)
-		err = e
-		b.StopTimer()
+		RecoverPubkey(msg, sig)
 	}
 }

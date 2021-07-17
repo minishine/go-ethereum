@@ -17,103 +17,66 @@
 package vm
 
 import (
-	"math"
-	"math/big"
-
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/holiman/uint256"
 )
 
-// Type is the VM type accepted by **NewVm**
-type Type byte
-
-const (
-	StdVmTy Type = iota // Default standard VM
-	JitVmTy             // LLVM JIT VM
-	MaxVmTy
-)
-
-var (
-	Pow256 = common.BigPow(2, 256) // Pow256 is 2**256
-
-	U256 = common.U256 // Shortcut to common.U256
-	S256 = common.S256 // Shortcut to common.S256
-
-	Zero = common.Big0 // Shortcut to common.Big0
-	One  = common.Big1 // Shortcut to common.Big1
-
-	max = big.NewInt(math.MaxInt64) // Maximum 64 bit integer
-)
-
-// calculates the memory size required for a step
-func calcMemSize(off, l *big.Int) *big.Int {
-	if l.Cmp(common.Big0) == 0 {
-		return common.Big0
+// calcMemSize64 calculates the required memory size, and returns
+// the size and whether the result overflowed uint64
+func calcMemSize64(off, l *uint256.Int) (uint64, bool) {
+	if !l.IsUint64() {
+		return 0, true
 	}
-
-	return new(big.Int).Add(off, l)
+	return calcMemSize64WithUint(off, l.Uint64())
 }
 
-// calculates the quadratic gas
-func quadMemGas(mem *Memory, newMemSize, gas *big.Int) {
-	if newMemSize.Cmp(common.Big0) > 0 {
-		newMemSizeWords := toWordSize(newMemSize)
-		newMemSize.Mul(newMemSizeWords, u256(32))
-
-		if newMemSize.Cmp(u256(int64(mem.Len()))) > 0 {
-			// be careful reusing variables here when changing.
-			// The order has been optimised to reduce allocation
-			oldSize := toWordSize(big.NewInt(int64(mem.Len())))
-			pow := new(big.Int).Exp(oldSize, common.Big2, Zero)
-			linCoef := oldSize.Mul(oldSize, params.MemoryGas)
-			quadCoef := new(big.Int).Div(pow, params.QuadCoeffDiv)
-			oldTotalFee := new(big.Int).Add(linCoef, quadCoef)
-
-			pow.Exp(newMemSizeWords, common.Big2, Zero)
-			linCoef = linCoef.Mul(newMemSizeWords, params.MemoryGas)
-			quadCoef = quadCoef.Div(pow, params.QuadCoeffDiv)
-			newTotalFee := linCoef.Add(linCoef, quadCoef)
-
-			fee := newTotalFee.Sub(newTotalFee, oldTotalFee)
-			gas.Add(gas, fee)
-		}
+// calcMemSize64WithUint calculates the required memory size, and returns
+// the size and whether the result overflowed uint64
+// Identical to calcMemSize64, but length is a uint64
+func calcMemSize64WithUint(off *uint256.Int, length64 uint64) (uint64, bool) {
+	// if length is zero, memsize is always zero, regardless of offset
+	if length64 == 0 {
+		return 0, false
 	}
-}
-
-// Simple helper
-func u256(n int64) *big.Int {
-	return big.NewInt(n)
-}
-
-// Mainly used for print variables and passing to Print*
-func toValue(val *big.Int) interface{} {
-	// Let's assume a string on right padded zero's
-	b := val.Bytes()
-	if b[0] != 0 && b[len(b)-1] == 0x0 && b[len(b)-2] == 0x0 {
-		return string(b)
+	// Check that offset doesn't overflow
+	offset64, overflow := off.Uint64WithOverflow()
+	if overflow {
+		return 0, true
 	}
-
-	return val
+	val := offset64 + length64
+	// if value < either of it's parts, then it overflowed
+	return val, val < offset64
 }
 
 // getData returns a slice from the data based on the start and size and pads
 // up to size with zero's. This function is overflow safe.
-func getData(data []byte, start, size *big.Int) []byte {
-	dlen := big.NewInt(int64(len(data)))
-
-	s := common.BigMin(start, dlen)
-	e := common.BigMin(new(big.Int).Add(s, size), dlen)
-	return common.RightPadBytes(data[s.Uint64():e.Uint64()], int(size.Uint64()))
+func getData(data []byte, start uint64, size uint64) []byte {
+	length := uint64(len(data))
+	if start > length {
+		start = length
+	}
+	end := start + size
+	if end > length {
+		end = length
+	}
+	return common.RightPadBytes(data[start:end], int(size))
 }
 
-// useGas attempts to subtract the amount of gas and returns whether it was
-// successful
-func useGas(gas, amount *big.Int) bool {
-	if gas.Cmp(amount) < 0 {
-		return false
+// toWordSize returns the ceiled word size required for memory expansion.
+func toWordSize(size uint64) uint64 {
+	if size > math.MaxUint64-31 {
+		return math.MaxUint64/32 + 1
 	}
 
-	// Sub the amount of gas from the remaining
-	gas.Sub(gas, amount)
+	return (size + 31) / 32
+}
+
+func allZero(b []byte) bool {
+	for _, byte := range b {
+		if byte != 0 {
+			return false
+		}
+	}
 	return true
 }

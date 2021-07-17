@@ -17,229 +17,329 @@
 package tests
 
 import (
-	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"io"
 	"math/big"
 	"strconv"
 	"strings"
-	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
-	"github.com/ethereum/go-ethereum/logger/glog"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
+	"golang.org/x/crypto/sha3"
 )
 
-func RunStateTestWithReader(chainConfig *params.ChainConfig, r io.Reader, skipTests []string) error {
-	tests := make(map[string]VmTest)
-	if err := readJson(r, &tests); err != nil {
-		return err
-	}
-
-	if err := runStateTests(chainConfig, tests, skipTests); err != nil {
-		return err
-	}
-
-	return nil
+// StateTest checks transaction processing without block context.
+// See https://github.com/ethereum/EIPs/issues/176 for the test format specification.
+type StateTest struct {
+	json stJSON
 }
 
-func RunStateTest(chainConfig *params.ChainConfig, p string, skipTests []string) error {
-	tests := make(map[string]VmTest)
-	if err := readJsonFile(p, &tests); err != nil {
-		return err
-	}
-
-	if err := runStateTests(chainConfig, tests, skipTests); err != nil {
-		return err
-	}
-
-	return nil
-
+// StateSubtest selects a specific configuration of a General State Test.
+type StateSubtest struct {
+	Fork  string
+	Index int
 }
 
-func BenchStateTest(chainConfig *params.ChainConfig, p string, conf bconf, b *testing.B) error {
-	tests := make(map[string]VmTest)
-	if err := readJsonFile(p, &tests); err != nil {
-		return err
-	}
-	test, ok := tests[conf.name]
-	if !ok {
-		return fmt.Errorf("test not found: %s", conf.name)
-	}
-
-	// XXX Yeah, yeah...
-	env := make(map[string]string)
-	env["currentCoinbase"] = test.Env.CurrentCoinbase
-	env["currentDifficulty"] = test.Env.CurrentDifficulty
-	env["currentGasLimit"] = test.Env.CurrentGasLimit
-	env["currentNumber"] = test.Env.CurrentNumber
-	env["previousHash"] = test.Env.PreviousHash
-	if n, ok := test.Env.CurrentTimestamp.(float64); ok {
-		env["currentTimestamp"] = strconv.Itoa(int(n))
-	} else {
-		env["currentTimestamp"] = test.Env.CurrentTimestamp.(string)
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		benchStateTest(chainConfig, test, env, b)
-	}
-
-	return nil
+func (t *StateTest) UnmarshalJSON(in []byte) error {
+	return json.Unmarshal(in, &t.json)
 }
 
-func benchStateTest(chainConfig *params.ChainConfig, test VmTest, env map[string]string, b *testing.B) {
-	b.StopTimer()
-	db, _ := ethdb.NewMemDatabase()
-	statedb := makePreState(db, test.Pre)
-	b.StartTimer()
-
-	RunState(chainConfig, statedb, env, test.Exec)
+type stJSON struct {
+	Env  stEnv                    `json:"env"`
+	Pre  core.GenesisAlloc        `json:"pre"`
+	Tx   stTransaction            `json:"transaction"`
+	Out  hexutil.Bytes            `json:"out"`
+	Post map[string][]stPostState `json:"post"`
 }
 
-func runStateTests(chainConfig *params.ChainConfig, tests map[string]VmTest, skipTests []string) error {
-	skipTest := make(map[string]bool, len(skipTests))
-	for _, name := range skipTests {
-		skipTest[name] = true
+type stPostState struct {
+	Root    common.UnprefixedHash `json:"hash"`
+	Logs    common.UnprefixedHash `json:"logs"`
+	Indexes struct {
+		Data  int `json:"data"`
+		Gas   int `json:"gas"`
+		Value int `json:"value"`
 	}
-
-	for name, test := range tests {
-		if skipTest[name] /*|| name != "NonZeroValue_CALL_ToEmpty"*/ {
-			glog.Infoln("Skipping state test", name)
-			continue
-		}
-
-		//fmt.Println("StateTest:", name)
-		if err := runStateTest(chainConfig, test); err != nil {
-			return fmt.Errorf("%s: %s\n", name, err.Error())
-		}
-
-		//glog.Infoln("State test passed: ", name)
-		//fmt.Println(string(statedb.Dump()))
-	}
-	return nil
-
 }
 
-func runStateTest(chainConfig *params.ChainConfig, test VmTest) error {
-	db, _ := ethdb.NewMemDatabase()
-	statedb := makePreState(db, test.Pre)
+//go:generate gencodec -type stEnv -field-override stEnvMarshaling -out gen_stenv.go
 
-	// XXX Yeah, yeah...
-	env := make(map[string]string)
-	env["currentCoinbase"] = test.Env.CurrentCoinbase
-	env["currentDifficulty"] = test.Env.CurrentDifficulty
-	env["currentGasLimit"] = test.Env.CurrentGasLimit
-	env["currentNumber"] = test.Env.CurrentNumber
-	env["previousHash"] = test.Env.PreviousHash
-	if n, ok := test.Env.CurrentTimestamp.(float64); ok {
-		env["currentTimestamp"] = strconv.Itoa(int(n))
-	} else {
-		env["currentTimestamp"] = test.Env.CurrentTimestamp.(string)
-	}
+type stEnv struct {
+	Coinbase   common.Address `json:"currentCoinbase"   gencodec:"required"`
+	Difficulty *big.Int       `json:"currentDifficulty" gencodec:"required"`
+	GasLimit   uint64         `json:"currentGasLimit"   gencodec:"required"`
+	Number     uint64         `json:"currentNumber"     gencodec:"required"`
+	Timestamp  uint64         `json:"currentTimestamp"  gencodec:"required"`
+	BaseFee    *big.Int       `json:"currentBaseFee"  gencodec:"optional"`
+}
 
+type stEnvMarshaling struct {
+	Coinbase   common.UnprefixedAddress
+	Difficulty *math.HexOrDecimal256
+	GasLimit   math.HexOrDecimal64
+	Number     math.HexOrDecimal64
+	Timestamp  math.HexOrDecimal64
+	BaseFee    *math.HexOrDecimal256
+}
+
+//go:generate gencodec -type stTransaction -field-override stTransactionMarshaling -out gen_sttransaction.go
+
+type stTransaction struct {
+	GasPrice             *big.Int            `json:"gasPrice"`
+	MaxFeePerGas         *big.Int            `json:"maxFeePerGas"`
+	MaxPriorityFeePerGas *big.Int            `json:"maxPriorityFeePerGas"`
+	Nonce                uint64              `json:"nonce"`
+	To                   string              `json:"to"`
+	Data                 []string            `json:"data"`
+	AccessLists          []*types.AccessList `json:"accessLists,omitempty"`
+	GasLimit             []uint64            `json:"gasLimit"`
+	Value                []string            `json:"value"`
+	PrivateKey           []byte              `json:"secretKey"`
+}
+
+type stTransactionMarshaling struct {
+	GasPrice             *math.HexOrDecimal256
+	MaxFeePerGas         *math.HexOrDecimal256
+	MaxPriorityFeePerGas *math.HexOrDecimal256
+	Nonce                math.HexOrDecimal64
+	GasLimit             []math.HexOrDecimal64
+	PrivateKey           hexutil.Bytes
+}
+
+// GetChainConfig takes a fork definition and returns a chain config.
+// The fork definition can be
+// - a plain forkname, e.g. `Byzantium`,
+// - a fork basename, and a list of EIPs to enable; e.g. `Byzantium+1884+1283`.
+func GetChainConfig(forkString string) (baseConfig *params.ChainConfig, eips []int, err error) {
 	var (
-		ret []byte
-		// gas  *big.Int
-		// err  error
-		logs vm.Logs
+		splitForks            = strings.Split(forkString, "+")
+		ok                    bool
+		baseName, eipsStrings = splitForks[0], splitForks[1:]
 	)
-
-	ret, logs, _, _ = RunState(chainConfig, statedb, env, test.Transaction)
-
-	// Compare expected and actual return
-	var rexp []byte
-	if strings.HasPrefix(test.Out, "#") {
-		n, _ := strconv.Atoi(test.Out[1:])
-		rexp = make([]byte, n)
-	} else {
-		rexp = common.FromHex(test.Out)
+	if baseConfig, ok = Forks[baseName]; !ok {
+		return nil, nil, UnsupportedForkError{baseName}
 	}
-	if bytes.Compare(rexp, ret) != 0 {
-		return fmt.Errorf("return failed. Expected %x, got %x\n", rexp, ret)
-	}
-
-	// check post state
-	for addr, account := range test.Post {
-		obj := statedb.GetStateObject(common.HexToAddress(addr))
-		if obj == nil {
-			return fmt.Errorf("did not find expected post-state account: %s", addr)
-		}
-
-		if obj.Balance().Cmp(common.Big(account.Balance)) != 0 {
-			return fmt.Errorf("(%x) balance failed. Expected: %v have: %v\n", obj.Address().Bytes()[:4], common.String2Big(account.Balance), obj.Balance())
-		}
-
-		if obj.Nonce() != common.String2Big(account.Nonce).Uint64() {
-			return fmt.Errorf("(%x) nonce failed. Expected: %v have: %v\n", obj.Address().Bytes()[:4], account.Nonce, obj.Nonce())
-		}
-
-		for addr, value := range account.Storage {
-			v := statedb.GetState(obj.Address(), common.HexToHash(addr))
-			vexp := common.HexToHash(value)
-
-			if v != vexp {
-				return fmt.Errorf("storage failed:\n%x: %s:\nexpected: %x\nhave:     %x\n(%v %v)\n", obj.Address().Bytes(), addr, vexp, v, vexp.Big(), v.Big())
+	for _, eip := range eipsStrings {
+		if eipNum, err := strconv.Atoi(eip); err != nil {
+			return nil, nil, fmt.Errorf("syntax error, invalid eip number %v", eipNum)
+		} else {
+			if !vm.ValidEip(eipNum) {
+				return nil, nil, fmt.Errorf("syntax error, invalid eip number %v", eipNum)
 			}
+			eips = append(eips, eipNum)
 		}
 	}
-
-	root, _ := statedb.Commit(false)
-	if common.HexToHash(test.PostStateRoot) != root {
-		return fmt.Errorf("Post state root error. Expected: %s have: %x", test.PostStateRoot, root)
-	}
-
-	// check logs
-	if len(test.Logs) > 0 {
-		if err := checkLogs(test.Logs, logs); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return baseConfig, eips, nil
 }
 
-func RunState(chainConfig *params.ChainConfig, statedb *state.StateDB, env, tx map[string]string) ([]byte, vm.Logs, *big.Int, error) {
-	var (
-		data  = common.FromHex(tx["data"])
-		gas   = common.Big(tx["gasLimit"])
-		price = common.Big(tx["gasPrice"])
-		value = common.Big(tx["value"])
-		nonce = common.Big(tx["nonce"]).Uint64()
-	)
-
-	var to *common.Address
-	if len(tx["to"]) > 2 {
-		t := common.HexToAddress(tx["to"])
-		to = &t
+// Subtests returns all valid subtests of the test.
+func (t *StateTest) Subtests() []StateSubtest {
+	var sub []StateSubtest
+	for fork, pss := range t.json.Post {
+		for i := range pss {
+			sub = append(sub, StateSubtest{fork, i})
+		}
 	}
-	// Set pre compiled contracts
-	vm.Precompiled = vm.PrecompiledContracts()
-	gaspool := new(core.GasPool).AddGas(common.Big(env["currentGasLimit"]))
+	return sub
+}
 
-	key, _ := hex.DecodeString(tx["secretKey"])
-	addr := crypto.PubkeyToAddress(crypto.ToECDSA(key).PublicKey)
-	message := types.NewMessage(addr, to, nonce, value, gas, price, data, true)
-	vmenv := NewEnvFromMap(chainConfig, statedb, env, tx)
-	vmenv.origin = addr
+// Run executes a specific subtest and verifies the post-state and logs
+func (t *StateTest) Run(subtest StateSubtest, vmconfig vm.Config, snapshotter bool) (*snapshot.Tree, *state.StateDB, error) {
+	snaps, statedb, root, err := t.RunNoVerify(subtest, vmconfig, snapshotter)
+	if err != nil {
+		return snaps, statedb, err
+	}
+	post := t.json.Post[subtest.Fork][subtest.Index]
+	// N.B: We need to do this in a two-step process, because the first Commit takes care
+	// of suicides, and we need to touch the coinbase _after_ it has potentially suicided.
+	if root != common.Hash(post.Root) {
+		return snaps, statedb, fmt.Errorf("post state root mismatch: got %x, want %x", root, post.Root)
+	}
+	if logs := rlpHash(statedb.Logs()); logs != common.Hash(post.Logs) {
+		return snaps, statedb, fmt.Errorf("post state logs hash mismatch: got %x, want %x", logs, post.Logs)
+	}
+	return snaps, statedb, nil
+}
 
-	root, _ := statedb.Commit(false)
-	statedb.Reset(root)
+// RunNoVerify runs a specific subtest and returns the statedb and post-state root
+func (t *StateTest) RunNoVerify(subtest StateSubtest, vmconfig vm.Config, snapshotter bool) (*snapshot.Tree, *state.StateDB, common.Hash, error) {
+	config, eips, err := GetChainConfig(subtest.Fork)
+	if err != nil {
+		return nil, nil, common.Hash{}, UnsupportedForkError{subtest.Fork}
+	}
+	vmconfig.ExtraEips = eips
+	block := t.genesis(config).ToBlock(nil)
+	snaps, statedb := MakePreState(rawdb.NewMemoryDatabase(), t.json.Pre, snapshotter)
 
+	var baseFee *big.Int
+	if config.IsLondon(new(big.Int)) {
+		baseFee = t.json.Env.BaseFee
+		if baseFee == nil {
+			// Retesteth uses `0x10` for genesis baseFee. Therefore, it defaults to
+			// parent - 2 : 0xa as the basefee for 'this' context.
+			baseFee = big.NewInt(0x0a)
+		}
+	}
+	post := t.json.Post[subtest.Fork][subtest.Index]
+	msg, err := t.json.Tx.toMessage(post, baseFee)
+	if err != nil {
+		return nil, nil, common.Hash{}, err
+	}
+
+	// Prepare the EVM.
+	txContext := core.NewEVMTxContext(msg)
+	context := core.NewEVMBlockContext(block.Header(), nil, &t.json.Env.Coinbase)
+	context.GetHash = vmTestBlockHash
+	context.BaseFee = baseFee
+	evm := vm.NewEVM(context, txContext, statedb, config, vmconfig)
+
+	// Execute the message.
 	snapshot := statedb.Snapshot()
-
-	ret, _, err := core.ApplyMessage(vmenv, message, gaspool)
-	if core.IsNonceErr(err) || core.IsInvalidTxErr(err) || core.IsGasLimitErr(err) {
+	gaspool := new(core.GasPool)
+	gaspool.AddGas(block.GasLimit())
+	if _, err := core.ApplyMessage(evm, msg, gaspool); err != nil {
 		statedb.RevertToSnapshot(snapshot)
 	}
-	statedb.Commit(chainConfig.IsEIP158(vmenv.BlockNumber()))
 
-	return ret, vmenv.state.Logs(), vmenv.Gas, err
+	// Commit block
+	statedb.Commit(config.IsEIP158(block.Number()))
+	// Add 0-value mining reward. This only makes a difference in the cases
+	// where
+	// - the coinbase suicided, or
+	// - there are only 'bad' transactions, which aren't executed. In those cases,
+	//   the coinbase gets no txfee, so isn't created, and thus needs to be touched
+	statedb.AddBalance(block.Coinbase(), new(big.Int))
+	// And _now_ get the state root
+	root := statedb.IntermediateRoot(config.IsEIP158(block.Number()))
+	return snaps, statedb, root, nil
+}
+
+func (t *StateTest) gasLimit(subtest StateSubtest) uint64 {
+	return t.json.Tx.GasLimit[t.json.Post[subtest.Fork][subtest.Index].Indexes.Gas]
+}
+
+func MakePreState(db ethdb.Database, accounts core.GenesisAlloc, snapshotter bool) (*snapshot.Tree, *state.StateDB) {
+	sdb := state.NewDatabase(db)
+	statedb, _ := state.New(common.Hash{}, sdb, nil)
+	for addr, a := range accounts {
+		statedb.SetCode(addr, a.Code)
+		statedb.SetNonce(addr, a.Nonce)
+		statedb.SetBalance(addr, a.Balance)
+		for k, v := range a.Storage {
+			statedb.SetState(addr, k, v)
+		}
+	}
+	// Commit and re-open to start with a clean state.
+	root, _ := statedb.Commit(false)
+
+	var snaps *snapshot.Tree
+	if snapshotter {
+		snaps, _ = snapshot.New(db, sdb.TrieDB(), 1, root, false, true, false)
+	}
+	statedb, _ = state.New(root, sdb, snaps)
+	return snaps, statedb
+}
+
+func (t *StateTest) genesis(config *params.ChainConfig) *core.Genesis {
+	return &core.Genesis{
+		Config:     config,
+		Coinbase:   t.json.Env.Coinbase,
+		Difficulty: t.json.Env.Difficulty,
+		GasLimit:   t.json.Env.GasLimit,
+		Number:     t.json.Env.Number,
+		Timestamp:  t.json.Env.Timestamp,
+		Alloc:      t.json.Pre,
+	}
+}
+
+func (tx *stTransaction) toMessage(ps stPostState, baseFee *big.Int) (core.Message, error) {
+	// Derive sender from private key if present.
+	var from common.Address
+	if len(tx.PrivateKey) > 0 {
+		key, err := crypto.ToECDSA(tx.PrivateKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid private key: %v", err)
+		}
+		from = crypto.PubkeyToAddress(key.PublicKey)
+	}
+	// Parse recipient if present.
+	var to *common.Address
+	if tx.To != "" {
+		to = new(common.Address)
+		if err := to.UnmarshalText([]byte(tx.To)); err != nil {
+			return nil, fmt.Errorf("invalid to address: %v", err)
+		}
+	}
+
+	// Get values specific to this post state.
+	if ps.Indexes.Data > len(tx.Data) {
+		return nil, fmt.Errorf("tx data index %d out of bounds", ps.Indexes.Data)
+	}
+	if ps.Indexes.Value > len(tx.Value) {
+		return nil, fmt.Errorf("tx value index %d out of bounds", ps.Indexes.Value)
+	}
+	if ps.Indexes.Gas > len(tx.GasLimit) {
+		return nil, fmt.Errorf("tx gas limit index %d out of bounds", ps.Indexes.Gas)
+	}
+	dataHex := tx.Data[ps.Indexes.Data]
+	valueHex := tx.Value[ps.Indexes.Value]
+	gasLimit := tx.GasLimit[ps.Indexes.Gas]
+	// Value, Data hex encoding is messy: https://github.com/ethereum/tests/issues/203
+	value := new(big.Int)
+	if valueHex != "0x" {
+		v, ok := math.ParseBig256(valueHex)
+		if !ok {
+			return nil, fmt.Errorf("invalid tx value %q", valueHex)
+		}
+		value = v
+	}
+	data, err := hex.DecodeString(strings.TrimPrefix(dataHex, "0x"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid tx data %q", dataHex)
+	}
+	var accessList types.AccessList
+	if tx.AccessLists != nil && tx.AccessLists[ps.Indexes.Data] != nil {
+		accessList = *tx.AccessLists[ps.Indexes.Data]
+	}
+	// If baseFee provided, set gasPrice to effectiveGasPrice.
+	gasPrice := tx.GasPrice
+	if baseFee != nil {
+		if tx.MaxFeePerGas == nil {
+			tx.MaxFeePerGas = gasPrice
+		}
+		if tx.MaxFeePerGas == nil {
+			tx.MaxFeePerGas = new(big.Int)
+		}
+		if tx.MaxPriorityFeePerGas == nil {
+			tx.MaxPriorityFeePerGas = tx.MaxFeePerGas
+		}
+		gasPrice = math.BigMin(new(big.Int).Add(tx.MaxPriorityFeePerGas, baseFee),
+			tx.MaxFeePerGas)
+	}
+	if gasPrice == nil {
+		return nil, fmt.Errorf("no gas price provided")
+	}
+
+	msg := types.NewMessage(from, to, tx.Nonce, value, gasLimit, gasPrice,
+		tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, data, accessList, true)
+	return msg, nil
+}
+
+func rlpHash(x interface{}) (h common.Hash) {
+	hw := sha3.NewLegacyKeccak256()
+	rlp.Encode(hw, x)
+	hw.Sum(h[:0])
+	return h
 }

@@ -24,22 +24,23 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// Signer is an interaface defining the callback when a contract requires a
+// Signer is an interface defining the callback when a contract requires a
 // method to sign the transaction before submission.
 type Signer interface {
-	Sign(*Address, *Transaction) (*Transaction, error)
+	Sign(addr *Address, unsignedTx *Transaction) (tx *Transaction, _ error)
 }
 
-type signer struct {
+type MobileSigner struct {
 	sign bind.SignerFn
 }
 
-func (s *signer) Sign(addr *Address, tx *Transaction) (*Transaction, error) {
-	sig, err := s.sign(types.HomesteadSigner{}, addr.address, tx.tx)
+func (s *MobileSigner) Sign(addr *Address, unsignedTx *Transaction) (signedTx *Transaction, _ error) {
+	sig, err := s.sign(addr.address, unsignedTx.tx)
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +67,7 @@ func (opts *CallOpts) GetGasLimit() int64 { return 0 /* TODO(karalabe) */ }
 func (opts *CallOpts) SetPending(pending bool)     { opts.opts.Pending = pending }
 func (opts *CallOpts) SetGasLimit(limit int64)     { /* TODO(karalabe) */ }
 func (opts *CallOpts) SetContext(context *Context) { opts.opts.Context = context.context }
+func (opts *CallOpts) SetFrom(addr *Address)       { opts.opts.From = addr.address }
 
 // TransactOpts is the collection of authorization data required to create a
 // valid Ethereum transaction.
@@ -73,11 +75,30 @@ type TransactOpts struct {
 	opts bind.TransactOpts
 }
 
+// NewTransactOpts creates a new option set for contract transaction.
+func NewTransactOpts() *TransactOpts {
+	return new(TransactOpts)
+}
+
+// NewKeyedTransactOpts is a utility method to easily create a transaction signer
+// from a single private key.
+func NewKeyedTransactOpts(keyJson []byte, passphrase string, chainID *big.Int) (*TransactOpts, error) {
+	key, err := keystore.DecryptKey(keyJson, passphrase)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := bind.NewKeyedTransactorWithChainID(key.PrivateKey, chainID)
+	if err != nil {
+		return nil, err
+	}
+	return &TransactOpts{*auth}, nil
+}
+
 func (opts *TransactOpts) GetFrom() *Address    { return &Address{opts.opts.From} }
 func (opts *TransactOpts) GetNonce() int64      { return opts.opts.Nonce.Int64() }
 func (opts *TransactOpts) GetValue() *BigInt    { return &BigInt{opts.opts.Value} }
 func (opts *TransactOpts) GetGasPrice() *BigInt { return &BigInt{opts.opts.GasPrice} }
-func (opts *TransactOpts) GetGasLimit() int64   { return opts.opts.GasLimit.Int64() }
+func (opts *TransactOpts) GetGasLimit() int64   { return int64(opts.opts.GasLimit) }
 
 // GetSigner cannot be reliably implemented without identity preservation (https://github.com/golang/go/issues/16876)
 // func (opts *TransactOpts) GetSigner() Signer { return &signer{opts.opts.Signer} }
@@ -89,7 +110,7 @@ func (opts *TransactOpts) GetGasLimit() int64   { return opts.opts.GasLimit.Int6
 func (opts *TransactOpts) SetFrom(from *Address) { opts.opts.From = from.address }
 func (opts *TransactOpts) SetNonce(nonce int64)  { opts.opts.Nonce = big.NewInt(nonce) }
 func (opts *TransactOpts) SetSigner(s Signer) {
-	opts.opts.Signer = func(signer types.Signer, addr common.Address, tx *types.Transaction) (*types.Transaction, error) {
+	opts.opts.Signer = func(addr common.Address, tx *types.Transaction) (*types.Transaction, error) {
 		sig, err := s.Sign(&Address{addr}, &Transaction{tx})
 		if err != nil {
 			return nil, err
@@ -99,7 +120,7 @@ func (opts *TransactOpts) SetSigner(s Signer) {
 }
 func (opts *TransactOpts) SetValue(value *BigInt)      { opts.opts.Value = value.bigint }
 func (opts *TransactOpts) SetGasPrice(price *BigInt)   { opts.opts.GasPrice = price.bigint }
-func (opts *TransactOpts) SetGasLimit(limit int64)     { opts.opts.GasLimit = big.NewInt(limit) }
+func (opts *TransactOpts) SetGasLimit(limit int64)     { opts.opts.GasLimit = uint64(limit) }
 func (opts *TransactOpts) SetContext(context *Context) { opts.opts.Context = context.context }
 
 // BoundContract is the base wrapper object that reflects a contract on the
@@ -113,18 +134,13 @@ type BoundContract struct {
 
 // DeployContract deploys a contract onto the Ethereum blockchain and binds the
 // deployment address with a wrapper.
-func DeployContract(opts *TransactOpts, abiJSON string, bytecode []byte, client *EthereumClient, args *Interfaces) (*BoundContract, error) {
-	// Convert all the deployment parameters to Go types
-	params := make([]interface{}, len(args.objects))
-	for i, obj := range args.objects {
-		params[i] = obj
-	}
+func DeployContract(opts *TransactOpts, abiJSON string, bytecode []byte, client *EthereumClient, args *Interfaces) (contract *BoundContract, _ error) {
 	// Deploy the contract to the network
 	parsed, err := abi.JSON(strings.NewReader(abiJSON))
 	if err != nil {
 		return nil, err
 	}
-	addr, tx, bound, err := bind.DeployContract(&opts.opts, parsed, bytecode, client.client, params...)
+	addr, tx, bound, err := bind.DeployContract(&opts.opts, parsed, common.CopyBytes(bytecode), client.client, args.objects...)
 	if err != nil {
 		return nil, err
 	}
@@ -137,13 +153,13 @@ func DeployContract(opts *TransactOpts, abiJSON string, bytecode []byte, client 
 
 // BindContract creates a low level contract interface through which calls and
 // transactions may be made through.
-func BindContract(address *Address, abiJSON string, client *EthereumClient) (*BoundContract, error) {
+func BindContract(address *Address, abiJSON string, client *EthereumClient) (contract *BoundContract, _ error) {
 	parsed, err := abi.JSON(strings.NewReader(abiJSON))
 	if err != nil {
 		return nil, err
 	}
 	return &BoundContract{
-		contract: bind.NewBoundContract(address.address, parsed, client.client, client.client),
+		contract: bind.NewBoundContract(address.address, parsed, client.client, client.client, client.client),
 		address:  address.address,
 	}, nil
 }
@@ -159,44 +175,39 @@ func (c *BoundContract) GetDeployer() *Transaction {
 // Call invokes the (constant) contract method with params as input values and
 // sets the output to result.
 func (c *BoundContract) Call(opts *CallOpts, out *Interfaces, method string, args *Interfaces) error {
-	// Convert all the input and output parameters to Go types
-	params := make([]interface{}, len(args.objects))
-	for i, obj := range args.objects {
-		params[i] = obj
-	}
 	results := make([]interface{}, len(out.objects))
-	for i, obj := range out.objects {
-		results[i] = obj
-	}
-	// Execute the call to the contract and wrap any results
-	if err := c.contract.Call(&opts.opts, &results, method, params...); err != nil {
+	copy(results, out.objects)
+	if err := c.contract.Call(&opts.opts, &results, method, args.objects...); err != nil {
 		return err
 	}
-	for i, res := range results {
-		out.objects[i] = res
-	}
+	copy(out.objects, results)
 	return nil
 }
 
 // Transact invokes the (paid) contract method with params as input values.
-func (c *BoundContract) Transact(opts *TransactOpts, method string, args *Interfaces) (*Transaction, error) {
-	params := make([]interface{}, len(args.objects))
-	for i, obj := range args.objects {
-		params[i] = obj
-	}
-	tx, err := c.contract.Transact(&opts.opts, method, params)
+func (c *BoundContract) Transact(opts *TransactOpts, method string, args *Interfaces) (tx *Transaction, _ error) {
+	rawTx, err := c.contract.Transact(&opts.opts, method, args.objects...)
 	if err != nil {
 		return nil, err
 	}
-	return &Transaction{tx}, nil
+	return &Transaction{rawTx}, nil
+}
+
+// RawTransact invokes the (paid) contract method with raw calldata as input values.
+func (c *BoundContract) RawTransact(opts *TransactOpts, calldata []byte) (tx *Transaction, _ error) {
+	rawTx, err := c.contract.RawTransact(&opts.opts, calldata)
+	if err != nil {
+		return nil, err
+	}
+	return &Transaction{rawTx}, nil
 }
 
 // Transfer initiates a plain transaction to move funds to the contract, calling
 // its default method if one is available.
-func (c *BoundContract) Transfer(opts *TransactOpts) (*Transaction, error) {
-	tx, err := c.contract.Transfer(&opts.opts)
+func (c *BoundContract) Transfer(opts *TransactOpts) (tx *Transaction, _ error) {
+	rawTx, err := c.contract.Transfer(&opts.opts)
 	if err != nil {
 		return nil, err
 	}
-	return &Transaction{tx}, nil
+	return &Transaction{rawTx}, nil
 }

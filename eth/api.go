@@ -17,33 +17,28 @@
 package eth
 
 import (
-	"bytes"
+	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
-	"github.com/ethereum/ethash"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
-	"github.com/ethereum/go-ethereum/miner"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
-	"golang.org/x/net/context"
+	"github.com/ethereum/go-ethereum/trie"
 )
-
-const defaultTraceTimeout = 5 * time.Second
 
 // PublicEthereumAPI provides an API to access Ethereum full node-related
 // information.
@@ -51,75 +46,40 @@ type PublicEthereumAPI struct {
 	e *Ethereum
 }
 
-// NewPublicEthereumAPI creates a new Etheruem protocol API for full nodes.
+// NewPublicEthereumAPI creates a new Ethereum protocol API for full nodes.
 func NewPublicEthereumAPI(e *Ethereum) *PublicEthereumAPI {
 	return &PublicEthereumAPI{e}
 }
 
 // Etherbase is the address that mining rewards will be send to
-func (s *PublicEthereumAPI) Etherbase() (common.Address, error) {
-	return s.e.Etherbase()
+func (api *PublicEthereumAPI) Etherbase() (common.Address, error) {
+	return api.e.Etherbase()
 }
 
 // Coinbase is the address that mining rewards will be send to (alias for Etherbase)
-func (s *PublicEthereumAPI) Coinbase() (common.Address, error) {
-	return s.Etherbase()
+func (api *PublicEthereumAPI) Coinbase() (common.Address, error) {
+	return api.Etherbase()
 }
 
 // Hashrate returns the POW hashrate
-func (s *PublicEthereumAPI) Hashrate() *rpc.HexNumber {
-	return rpc.NewHexNumber(s.e.Miner().HashRate())
+func (api *PublicEthereumAPI) Hashrate() hexutil.Uint64 {
+	return hexutil.Uint64(api.e.Miner().Hashrate())
 }
 
 // PublicMinerAPI provides an API to control the miner.
 // It offers only methods that operate on data that pose no security risk when it is publicly accessible.
 type PublicMinerAPI struct {
-	e     *Ethereum
-	agent *miner.RemoteAgent
+	e *Ethereum
 }
 
 // NewPublicMinerAPI create a new PublicMinerAPI instance.
 func NewPublicMinerAPI(e *Ethereum) *PublicMinerAPI {
-	agent := miner.NewRemoteAgent()
-	e.Miner().Register(agent)
-
-	return &PublicMinerAPI{e, agent}
+	return &PublicMinerAPI{e}
 }
 
 // Mining returns an indication if this node is currently mining.
-func (s *PublicMinerAPI) Mining() bool {
-	return s.e.IsMining()
-}
-
-// SubmitWork can be used by external miner to submit their POW solution. It returns an indication if the work was
-// accepted. Note, this is not an indication if the provided work was valid!
-func (s *PublicMinerAPI) SubmitWork(nonce rpc.HexNumber, solution, digest common.Hash) bool {
-	return s.agent.SubmitWork(nonce.Uint64(), digest, solution)
-}
-
-// GetWork returns a work package for external miner. The work package consists of 3 strings
-// result[0], 32 bytes hex encoded current block header pow-hash
-// result[1], 32 bytes hex encoded seed hash used for DAG
-// result[2], 32 bytes hex encoded boundary condition ("target"), 2^256/difficulty
-func (s *PublicMinerAPI) GetWork() (work [3]string, err error) {
-	if !s.e.IsMining() {
-		if err := s.e.StartMining(0); err != nil {
-			return work, err
-		}
-	}
-	if work, err = s.agent.GetWork(); err == nil {
-		return
-	}
-	glog.V(logger.Debug).Infof("%v", err)
-	return work, fmt.Errorf("mining not ready")
-}
-
-// SubmitHashrate can be used for remote miners to submit their hash rate. This enables the node to report the combined
-// hash rate of all miners which submit work through this node. It accepts the miner hash rate and an identifier which
-// must be unique between nodes.
-func (s *PublicMinerAPI) SubmitHashrate(hashrate rpc.HexNumber, id common.Hash) bool {
-	s.agent.SubmitHashrate(id, hashrate.Uint64())
-	return true
+func (api *PublicMinerAPI) Mining() bool {
+	return api.e.IsMining()
 }
 
 // PrivateMinerAPI provides private RPC methods to control the miner.
@@ -133,70 +93,60 @@ func NewPrivateMinerAPI(e *Ethereum) *PrivateMinerAPI {
 	return &PrivateMinerAPI{e: e}
 }
 
-// Start the miner with the given number of threads. If threads is nil the number of
-// workers started is equal to the number of logical CPU's that are usable by this process.
-func (s *PrivateMinerAPI) Start(threads *rpc.HexNumber) (bool, error) {
-	s.e.StartAutoDAG()
-
+// Start starts the miner with the given number of threads. If threads is nil,
+// the number of workers started is equal to the number of logical CPUs that are
+// usable by this process. If mining is already running, this method adjust the
+// number of threads allowed to use and updates the minimum price required by the
+// transaction pool.
+func (api *PrivateMinerAPI) Start(threads *int) error {
 	if threads == nil {
-		threads = rpc.NewHexNumber(runtime.NumCPU())
+		return api.e.StartMining(runtime.NumCPU())
 	}
-
-	err := s.e.StartMining(threads.Int())
-	if err == nil {
-		return true, nil
-	}
-	return false, err
+	return api.e.StartMining(*threads)
 }
 
-// Stop the miner
-func (s *PrivateMinerAPI) Stop() bool {
-	s.e.StopMining()
-	return true
+// Stop terminates the miner, both at the consensus engine level as well as at
+// the block creation level.
+func (api *PrivateMinerAPI) Stop() {
+	api.e.StopMining()
 }
 
 // SetExtra sets the extra data string that is included when this miner mines a block.
-func (s *PrivateMinerAPI) SetExtra(extra string) (bool, error) {
-	if err := s.e.Miner().SetExtra([]byte(extra)); err != nil {
+func (api *PrivateMinerAPI) SetExtra(extra string) (bool, error) {
+	if err := api.e.Miner().SetExtra([]byte(extra)); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
 // SetGasPrice sets the minimum accepted gas price for the miner.
-func (s *PrivateMinerAPI) SetGasPrice(gasPrice rpc.HexNumber) bool {
-	s.e.Miner().SetGasPrice(gasPrice.BigInt())
+func (api *PrivateMinerAPI) SetGasPrice(gasPrice hexutil.Big) bool {
+	api.e.lock.Lock()
+	api.e.gasPrice = (*big.Int)(&gasPrice)
+	api.e.lock.Unlock()
+
+	api.e.txPool.SetGasPrice((*big.Int)(&gasPrice))
+	return true
+}
+
+// SetGasLimit sets the gaslimit to target towards during mining.
+func (api *PrivateMinerAPI) SetGasLimit(gasLimit hexutil.Uint64) bool {
+	api.e.Miner().SetGasCeil(uint64(gasLimit))
 	return true
 }
 
 // SetEtherbase sets the etherbase of the miner
-func (s *PrivateMinerAPI) SetEtherbase(etherbase common.Address) bool {
-	s.e.SetEtherbase(etherbase)
+func (api *PrivateMinerAPI) SetEtherbase(etherbase common.Address) bool {
+	api.e.SetEtherbase(etherbase)
 	return true
 }
 
-// StartAutoDAG starts auto DAG generation. This will prevent the DAG generating on epoch change
-// which will cause the node to stop mining during the generation process.
-func (s *PrivateMinerAPI) StartAutoDAG() bool {
-	s.e.StartAutoDAG()
-	return true
+// SetRecommitInterval updates the interval for miner sealing work recommitting.
+func (api *PrivateMinerAPI) SetRecommitInterval(interval int) {
+	api.e.Miner().SetRecommitInterval(time.Duration(interval) * time.Millisecond)
 }
 
-// StopAutoDAG stops auto DAG generation
-func (s *PrivateMinerAPI) StopAutoDAG() bool {
-	s.e.StopAutoDAG()
-	return true
-}
-
-// MakeDAG creates the new DAG for the given block number
-func (s *PrivateMinerAPI) MakeDAG(blockNr rpc.BlockNumber) (bool, error) {
-	if err := ethash.MakeDAG(uint64(blockNr.Int64()), ""); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-// PrivateAdminAPI is the collection of Etheruem full node-related APIs
+// PrivateAdminAPI is the collection of Ethereum full node-related APIs
 // exposed over the private admin endpoint.
 type PrivateAdminAPI struct {
 	eth *Ethereum
@@ -208,8 +158,21 @@ func NewPrivateAdminAPI(eth *Ethereum) *PrivateAdminAPI {
 	return &PrivateAdminAPI{eth: eth}
 }
 
-// ExportChain exports the current blockchain into a local file.
-func (api *PrivateAdminAPI) ExportChain(file string) (bool, error) {
+// ExportChain exports the current blockchain into a local file,
+// or a range of blocks if first and last are non-nil
+func (api *PrivateAdminAPI) ExportChain(file string, first *uint64, last *uint64) (bool, error) {
+	if first == nil && last != nil {
+		return false, errors.New("last cannot be specified without first")
+	}
+	if first != nil && last == nil {
+		head := api.eth.BlockChain().CurrentHeader().Number.Uint64()
+		last = &head
+	}
+	if _, err := os.Stat(file); err == nil {
+		// File already exists. Allowing overwrite could be a DoS vecotor,
+		// since the 'file' may point to arbitrary paths on the drive
+		return false, errors.New("location would overwrite an existing file")
+	}
 	// Make sure we can create the file to export into
 	out, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.ModePerm)
 	if err != nil {
@@ -217,8 +180,18 @@ func (api *PrivateAdminAPI) ExportChain(file string) (bool, error) {
 	}
 	defer out.Close()
 
+	var writer io.Writer = out
+	if strings.HasSuffix(file, ".gz") {
+		writer = gzip.NewWriter(writer)
+		defer writer.(*gzip.Writer).Close()
+	}
+
 	// Export the blockchain
-	if err := api.eth.BlockChain().Export(out); err != nil {
+	if first != nil {
+		if err := api.eth.BlockChain().ExportN(writer, *first, *last); err != nil {
+			return false, err
+		}
+	} else if err := api.eth.BlockChain().Export(writer); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -226,7 +199,7 @@ func (api *PrivateAdminAPI) ExportChain(file string) (bool, error) {
 
 func hasAllBlocks(chain *core.BlockChain, bs []*types.Block) bool {
 	for _, b := range bs {
-		if !chain.HasBlock(b.Hash()) {
+		if !chain.HasBlock(b.Hash(), b.NumberU64()) {
 			return false
 		}
 	}
@@ -243,8 +216,15 @@ func (api *PrivateAdminAPI) ImportChain(file string) (bool, error) {
 	}
 	defer in.Close()
 
+	var reader io.Reader = in
+	if strings.HasSuffix(file, ".gz") {
+		if reader, err = gzip.NewReader(reader); err != nil {
+			return false, err
+		}
+	}
+
 	// Run actual the import in pre-configured batches
-	stream := rlp.NewStream(in, 0)
+	stream := rlp.NewStream(reader, 0)
 
 	blocks, index := make([]*types.Block, 0, 2500), 0
 	for batch := 0; ; batch++ {
@@ -276,7 +256,7 @@ func (api *PrivateAdminAPI) ImportChain(file string) (bool, error) {
 	return true, nil
 }
 
-// PublicDebugAPI is the collection of Etheruem full node APIs exposed
+// PublicDebugAPI is the collection of Ethereum full node APIs exposed
 // over the public debugging endpoint.
 type PublicDebugAPI struct {
 	eth *Ethereum
@@ -289,259 +269,279 @@ func NewPublicDebugAPI(eth *Ethereum) *PublicDebugAPI {
 }
 
 // DumpBlock retrieves the entire state of the database at a given block.
-func (api *PublicDebugAPI) DumpBlock(number uint64) (state.Dump, error) {
-	block := api.eth.BlockChain().GetBlockByNumber(number)
+func (api *PublicDebugAPI) DumpBlock(blockNr rpc.BlockNumber) (state.Dump, error) {
+	opts := &state.DumpConfig{
+		OnlyWithAddresses: true,
+		Max:               AccountRangeMaxResults, // Sanity limit over RPC
+	}
+	if blockNr == rpc.PendingBlockNumber {
+		// If we're dumping the pending state, we need to request
+		// both the pending block as well as the pending state from
+		// the miner and operate on those
+		_, stateDb := api.eth.miner.Pending()
+		return stateDb.RawDump(opts), nil
+	}
+	var block *types.Block
+	if blockNr == rpc.LatestBlockNumber {
+		block = api.eth.blockchain.CurrentBlock()
+	} else {
+		block = api.eth.blockchain.GetBlockByNumber(uint64(blockNr))
+	}
 	if block == nil {
-		return state.Dump{}, fmt.Errorf("block #%d not found", number)
+		return state.Dump{}, fmt.Errorf("block #%d not found", blockNr)
 	}
 	stateDb, err := api.eth.BlockChain().StateAt(block.Root())
 	if err != nil {
 		return state.Dump{}, err
 	}
-	return stateDb.RawDump(), nil
+	return stateDb.RawDump(opts), nil
 }
 
-// PrivateDebugAPI is the collection of Etheruem full node APIs exposed over
+// PrivateDebugAPI is the collection of Ethereum full node APIs exposed over
 // the private debugging endpoint.
 type PrivateDebugAPI struct {
-	config *params.ChainConfig
-	eth    *Ethereum
+	eth *Ethereum
 }
 
 // NewPrivateDebugAPI creates a new API definition for the full node-related
 // private debug methods of the Ethereum service.
-func NewPrivateDebugAPI(config *params.ChainConfig, eth *Ethereum) *PrivateDebugAPI {
-	return &PrivateDebugAPI{config: config, eth: eth}
+func NewPrivateDebugAPI(eth *Ethereum) *PrivateDebugAPI {
+	return &PrivateDebugAPI{eth: eth}
 }
 
-// BlockTraceResult is the returned value when replaying a block to check for
-// consensus results and full VM trace logs for all included transactions.
-type BlockTraceResult struct {
-	Validated  bool                  `json:"validated"`
-	StructLogs []ethapi.StructLogRes `json:"structLogs"`
-	Error      string                `json:"error"`
+// Preimage is a debug API function that returns the preimage for a sha3 hash, if known.
+func (api *PrivateDebugAPI) Preimage(ctx context.Context, hash common.Hash) (hexutil.Bytes, error) {
+	if preimage := rawdb.ReadPreimage(api.eth.ChainDb(), hash); preimage != nil {
+		return preimage, nil
+	}
+	return nil, errors.New("unknown preimage")
 }
 
-// TraceArgs holds extra parameters to trace functions
-type TraceArgs struct {
-	*vm.LogConfig
-	Tracer  *string
-	Timeout *string
+// BadBlockArgs represents the entries in the list returned when bad blocks are queried.
+type BadBlockArgs struct {
+	Hash  common.Hash            `json:"hash"`
+	Block map[string]interface{} `json:"block"`
+	RLP   string                 `json:"rlp"`
 }
 
-// TraceBlock processes the given block's RLP but does not import the block in to
-// the chain.
-func (api *PrivateDebugAPI) TraceBlock(blockRlp []byte, config *vm.LogConfig) BlockTraceResult {
-	var block types.Block
-	err := rlp.Decode(bytes.NewReader(blockRlp), &block)
-	if err != nil {
-		return BlockTraceResult{Error: fmt.Sprintf("could not decode block: %v", err)}
-	}
-
-	validated, logs, err := api.traceBlock(&block, config)
-	return BlockTraceResult{
-		Validated:  validated,
-		StructLogs: ethapi.FormatLogs(logs),
-		Error:      formatError(err),
-	}
-}
-
-// TraceBlockFromFile loads the block's RLP from the given file name and attempts to
-// process it but does not import the block in to the chain.
-func (api *PrivateDebugAPI) TraceBlockFromFile(file string, config *vm.LogConfig) BlockTraceResult {
-	blockRlp, err := ioutil.ReadFile(file)
-	if err != nil {
-		return BlockTraceResult{Error: fmt.Sprintf("could not read file: %v", err)}
-	}
-	return api.TraceBlock(blockRlp, config)
-}
-
-// TraceBlockByNumber processes the block by canonical block number.
-func (api *PrivateDebugAPI) TraceBlockByNumber(number uint64, config *vm.LogConfig) BlockTraceResult {
-	// Fetch the block that we aim to reprocess
-	block := api.eth.BlockChain().GetBlockByNumber(number)
-	if block == nil {
-		return BlockTraceResult{Error: fmt.Sprintf("block #%d not found", number)}
-	}
-
-	validated, logs, err := api.traceBlock(block, config)
-	return BlockTraceResult{
-		Validated:  validated,
-		StructLogs: ethapi.FormatLogs(logs),
-		Error:      formatError(err),
-	}
-}
-
-// TraceBlockByHash processes the block by hash.
-func (api *PrivateDebugAPI) TraceBlockByHash(hash common.Hash, config *vm.LogConfig) BlockTraceResult {
-	// Fetch the block that we aim to reprocess
-	block := api.eth.BlockChain().GetBlockByHash(hash)
-	if block == nil {
-		return BlockTraceResult{Error: fmt.Sprintf("block #%x not found", hash)}
-	}
-
-	validated, logs, err := api.traceBlock(block, config)
-	return BlockTraceResult{
-		Validated:  validated,
-		StructLogs: ethapi.FormatLogs(logs),
-		Error:      formatError(err),
-	}
-}
-
-// traceBlock processes the given block but does not save the state.
-func (api *PrivateDebugAPI) traceBlock(block *types.Block, logConfig *vm.LogConfig) (bool, []vm.StructLog, error) {
-	// Validate and reprocess the block
+// GetBadBlocks returns a list of the last 'bad blocks' that the client has seen on the network
+// and returns them as a JSON list of block-hashes
+func (api *PrivateDebugAPI) GetBadBlocks(ctx context.Context) ([]*BadBlockArgs, error) {
 	var (
-		blockchain = api.eth.BlockChain()
-		validator  = blockchain.Validator()
-		processor  = blockchain.Processor()
+		err     error
+		blocks  = rawdb.ReadAllBadBlocks(api.eth.chainDb)
+		results = make([]*BadBlockArgs, 0, len(blocks))
 	)
-
-	structLogger := vm.NewStructLogger(logConfig)
-
-	config := vm.Config{
-		Debug:  true,
-		Tracer: structLogger,
+	for _, block := range blocks {
+		var (
+			blockRlp  string
+			blockJSON map[string]interface{}
+		)
+		if rlpBytes, err := rlp.EncodeToBytes(block); err != nil {
+			blockRlp = err.Error() // Hacky, but hey, it works
+		} else {
+			blockRlp = fmt.Sprintf("0x%x", rlpBytes)
+		}
+		if blockJSON, err = ethapi.RPCMarshalBlock(block, true, true); err != nil {
+			blockJSON = map[string]interface{}{"error": err.Error()}
+		}
+		results = append(results, &BadBlockArgs{
+			Hash:  block.Hash(),
+			RLP:   blockRlp,
+			Block: blockJSON,
+		})
 	}
-
-	if err := core.ValidateHeader(api.config, blockchain.AuxValidator(), block.Header(), blockchain.GetHeader(block.ParentHash(), block.NumberU64()-1), true, false); err != nil {
-		return false, structLogger.StructLogs(), err
-	}
-	statedb, err := blockchain.StateAt(blockchain.GetBlock(block.ParentHash(), block.NumberU64()-1).Root())
-	if err != nil {
-		return false, structLogger.StructLogs(), err
-	}
-
-	receipts, _, usedGas, err := processor.Process(block, statedb, config)
-	if err != nil {
-		return false, structLogger.StructLogs(), err
-	}
-	if err := validator.ValidateState(block, blockchain.GetBlock(block.ParentHash(), block.NumberU64()-1), statedb, receipts, usedGas); err != nil {
-		return false, structLogger.StructLogs(), err
-	}
-	return true, structLogger.StructLogs(), nil
+	return results, nil
 }
 
-// callmsg is the message type used for call transations.
-type callmsg struct {
-	addr          common.Address
-	to            *common.Address
-	gas, gasPrice *big.Int
-	value         *big.Int
-	data          []byte
-}
+// AccountRangeMaxResults is the maximum number of results to be returned per call
+const AccountRangeMaxResults = 256
 
-// accessor boilerplate to implement core.Message
-func (m callmsg) From() (common.Address, error)         { return m.addr, nil }
-func (m callmsg) FromFrontier() (common.Address, error) { return m.addr, nil }
-func (m callmsg) Nonce() uint64                         { return 0 }
-func (m callmsg) CheckNonce() bool                      { return false }
-func (m callmsg) To() *common.Address                   { return m.to }
-func (m callmsg) GasPrice() *big.Int                    { return m.gasPrice }
-func (m callmsg) Gas() *big.Int                         { return m.gas }
-func (m callmsg) Value() *big.Int                       { return m.value }
-func (m callmsg) Data() []byte                          { return m.data }
+// AccountRange enumerates all accounts in the given block and start point in paging request
+func (api *PublicDebugAPI) AccountRange(blockNrOrHash rpc.BlockNumberOrHash, start []byte, maxResults int, nocode, nostorage, incompletes bool) (state.IteratorDump, error) {
+	var stateDb *state.StateDB
+	var err error
 
-// formatError formats a Go error into either an empty string or the data content
-// of the error itself.
-func formatError(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
-type timeoutError struct{}
-
-func (t *timeoutError) Error() string {
-	return "Execution time exceeded"
-}
-
-// TraceTransaction returns the structured logs created during the execution of EVM
-// and returns them as a JSON object.
-func (api *PrivateDebugAPI) TraceTransaction(ctx context.Context, txHash common.Hash, config *TraceArgs) (interface{}, error) {
-	var tracer vm.Tracer
-	if config != nil && config.Tracer != nil {
-		timeout := defaultTraceTimeout
-		if config.Timeout != nil {
-			var err error
-			if timeout, err = time.ParseDuration(*config.Timeout); err != nil {
-				return nil, err
+	if number, ok := blockNrOrHash.Number(); ok {
+		if number == rpc.PendingBlockNumber {
+			// If we're dumping the pending state, we need to request
+			// both the pending block as well as the pending state from
+			// the miner and operate on those
+			_, stateDb = api.eth.miner.Pending()
+		} else {
+			var block *types.Block
+			if number == rpc.LatestBlockNumber {
+				block = api.eth.blockchain.CurrentBlock()
+			} else {
+				block = api.eth.blockchain.GetBlockByNumber(uint64(number))
+			}
+			if block == nil {
+				return state.IteratorDump{}, fmt.Errorf("block #%d not found", number)
+			}
+			stateDb, err = api.eth.BlockChain().StateAt(block.Root())
+			if err != nil {
+				return state.IteratorDump{}, err
 			}
 		}
-
-		var err error
-		if tracer, err = ethapi.NewJavascriptTracer(*config.Tracer); err != nil {
-			return nil, err
+	} else if hash, ok := blockNrOrHash.Hash(); ok {
+		block := api.eth.blockchain.GetBlockByHash(hash)
+		if block == nil {
+			return state.IteratorDump{}, fmt.Errorf("block %s not found", hash.Hex())
 		}
-
-		// Handle timeouts and RPC cancellations
-		deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
-		go func() {
-			<-deadlineCtx.Done()
-			tracer.(*ethapi.JavascriptTracer).Stop(&timeoutError{})
-		}()
-		defer cancel()
-	} else if config == nil {
-		tracer = vm.NewStructLogger(nil)
+		stateDb, err = api.eth.BlockChain().StateAt(block.Root())
+		if err != nil {
+			return state.IteratorDump{}, err
+		}
 	} else {
-		tracer = vm.NewStructLogger(config.LogConfig)
+		return state.IteratorDump{}, errors.New("either block number or block hash must be specified")
 	}
 
-	// Retrieve the tx from the chain and the containing block
-	tx, blockHash, _, txIndex := core.GetTransaction(api.eth.ChainDb(), txHash)
-	if tx == nil {
-		return nil, fmt.Errorf("transaction %x not found", txHash)
+	opts := &state.DumpConfig{
+		SkipCode:          nocode,
+		SkipStorage:       nostorage,
+		OnlyWithAddresses: !incompletes,
+		Start:             start,
+		Max:               uint64(maxResults),
 	}
-	block := api.eth.BlockChain().GetBlockByHash(blockHash)
+	if maxResults > AccountRangeMaxResults || maxResults <= 0 {
+		opts.Max = AccountRangeMaxResults
+	}
+	return stateDb.IteratorDump(opts), nil
+}
+
+// StorageRangeResult is the result of a debug_storageRangeAt API call.
+type StorageRangeResult struct {
+	Storage storageMap   `json:"storage"`
+	NextKey *common.Hash `json:"nextKey"` // nil if Storage includes the last key in the trie.
+}
+
+type storageMap map[common.Hash]storageEntry
+
+type storageEntry struct {
+	Key   *common.Hash `json:"key"`
+	Value common.Hash  `json:"value"`
+}
+
+// StorageRangeAt returns the storage at the given block height and transaction index.
+func (api *PrivateDebugAPI) StorageRangeAt(blockHash common.Hash, txIndex int, contractAddress common.Address, keyStart hexutil.Bytes, maxResult int) (StorageRangeResult, error) {
+	// Retrieve the block
+	block := api.eth.blockchain.GetBlockByHash(blockHash)
 	if block == nil {
-		return nil, fmt.Errorf("block %x not found", blockHash)
+		return StorageRangeResult{}, fmt.Errorf("block %#x not found", blockHash)
 	}
-	// Create the state database to mutate and eventually trace
-	parent := api.eth.BlockChain().GetBlock(block.ParentHash(), block.NumberU64()-1)
-	if parent == nil {
-		return nil, fmt.Errorf("block parent %x not found", block.ParentHash())
+	_, _, statedb, err := api.eth.stateAtTransaction(block, txIndex, 0)
+	if err != nil {
+		return StorageRangeResult{}, err
 	}
-	stateDb, err := api.eth.BlockChain().StateAt(parent.Root())
+	st := statedb.StorageTrie(contractAddress)
+	if st == nil {
+		return StorageRangeResult{}, fmt.Errorf("account %x doesn't exist", contractAddress)
+	}
+	return storageRangeAt(st, keyStart, maxResult)
+}
+
+func storageRangeAt(st state.Trie, start []byte, maxResult int) (StorageRangeResult, error) {
+	it := trie.NewIterator(st.NodeIterator(start))
+	result := StorageRangeResult{Storage: storageMap{}}
+	for i := 0; i < maxResult && it.Next(); i++ {
+		_, content, _, err := rlp.Split(it.Value)
+		if err != nil {
+			return StorageRangeResult{}, err
+		}
+		e := storageEntry{Value: common.BytesToHash(content)}
+		if preimage := st.GetKey(it.Key); preimage != nil {
+			preimage := common.BytesToHash(preimage)
+			e.Key = &preimage
+		}
+		result.Storage[common.BytesToHash(it.Key)] = e
+	}
+	// Add the 'next key' so clients can continue downloading.
+	if it.Next() {
+		next := common.BytesToHash(it.Key)
+		result.NextKey = &next
+	}
+	return result, nil
+}
+
+// GetModifiedAccountsByNumber returns all accounts that have changed between the
+// two blocks specified. A change is defined as a difference in nonce, balance,
+// code hash, or storage hash.
+//
+// With one parameter, returns the list of accounts modified in the specified block.
+func (api *PrivateDebugAPI) GetModifiedAccountsByNumber(startNum uint64, endNum *uint64) ([]common.Address, error) {
+	var startBlock, endBlock *types.Block
+
+	startBlock = api.eth.blockchain.GetBlockByNumber(startNum)
+	if startBlock == nil {
+		return nil, fmt.Errorf("start block %x not found", startNum)
+	}
+
+	if endNum == nil {
+		endBlock = startBlock
+		startBlock = api.eth.blockchain.GetBlockByHash(startBlock.ParentHash())
+		if startBlock == nil {
+			return nil, fmt.Errorf("block %x has no parent", endBlock.Number())
+		}
+	} else {
+		endBlock = api.eth.blockchain.GetBlockByNumber(*endNum)
+		if endBlock == nil {
+			return nil, fmt.Errorf("end block %d not found", *endNum)
+		}
+	}
+	return api.getModifiedAccounts(startBlock, endBlock)
+}
+
+// GetModifiedAccountsByHash returns all accounts that have changed between the
+// two blocks specified. A change is defined as a difference in nonce, balance,
+// code hash, or storage hash.
+//
+// With one parameter, returns the list of accounts modified in the specified block.
+func (api *PrivateDebugAPI) GetModifiedAccountsByHash(startHash common.Hash, endHash *common.Hash) ([]common.Address, error) {
+	var startBlock, endBlock *types.Block
+	startBlock = api.eth.blockchain.GetBlockByHash(startHash)
+	if startBlock == nil {
+		return nil, fmt.Errorf("start block %x not found", startHash)
+	}
+
+	if endHash == nil {
+		endBlock = startBlock
+		startBlock = api.eth.blockchain.GetBlockByHash(startBlock.ParentHash())
+		if startBlock == nil {
+			return nil, fmt.Errorf("block %x has no parent", endBlock.Number())
+		}
+	} else {
+		endBlock = api.eth.blockchain.GetBlockByHash(*endHash)
+		if endBlock == nil {
+			return nil, fmt.Errorf("end block %x not found", *endHash)
+		}
+	}
+	return api.getModifiedAccounts(startBlock, endBlock)
+}
+
+func (api *PrivateDebugAPI) getModifiedAccounts(startBlock, endBlock *types.Block) ([]common.Address, error) {
+	if startBlock.Number().Uint64() >= endBlock.Number().Uint64() {
+		return nil, fmt.Errorf("start block height (%d) must be less than end block height (%d)", startBlock.Number().Uint64(), endBlock.Number().Uint64())
+	}
+	triedb := api.eth.BlockChain().StateCache().TrieDB()
+
+	oldTrie, err := trie.NewSecure(startBlock.Root(), triedb)
 	if err != nil {
 		return nil, err
 	}
-
-	signer := types.MakeSigner(api.config, block.Number())
-	// Mutate the state and trace the selected transaction
-	for idx, tx := range block.Transactions() {
-		// Assemble the transaction call message
-		msg, err := tx.AsMessage(signer)
-		if err != nil {
-			return nil, fmt.Errorf("sender retrieval failed: %v", err)
-		}
-		// Mutate the state if we haven't reached the tracing transaction yet
-		if uint64(idx) < txIndex {
-			vmenv := core.NewEnv(stateDb, api.config, api.eth.BlockChain(), msg, block.Header(), vm.Config{})
-			_, _, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(tx.Gas()))
-			if err != nil {
-				return nil, fmt.Errorf("mutation failed: %v", err)
-			}
-			stateDb.DeleteSuicides()
-			continue
-		}
-		// Otherwise trace the transaction and return
-		vmenv := core.NewEnv(stateDb, api.config, api.eth.BlockChain(), msg, block.Header(), vm.Config{Debug: true, Tracer: tracer})
-		ret, gas, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(tx.Gas()))
-		if err != nil {
-			return nil, fmt.Errorf("tracing failed: %v", err)
-		}
-
-		switch tracer := tracer.(type) {
-		case *vm.StructLogger:
-			return &ethapi.ExecutionResult{
-				Gas:         gas,
-				ReturnValue: fmt.Sprintf("%x", ret),
-				StructLogs:  ethapi.FormatLogs(tracer.StructLogs()),
-			}, nil
-		case *ethapi.JavascriptTracer:
-			return tracer.GetResult()
-		}
+	newTrie, err := trie.NewSecure(endBlock.Root(), triedb)
+	if err != nil {
+		return nil, err
 	}
-	return nil, errors.New("database inconsistency")
+	diff, _ := trie.NewDifferenceIterator(oldTrie.NodeIterator([]byte{}), newTrie.NodeIterator([]byte{}))
+	iter := trie.NewIterator(diff)
+
+	var dirty []common.Address
+	for iter.Next() {
+		key := newTrie.GetKey(iter.Key)
+		if key == nil {
+			return nil, fmt.Errorf("no preimage found for hash %x", iter.Key)
+		}
+		dirty = append(dirty, common.BytesToAddress(key))
+	}
+	return dirty, nil
 }

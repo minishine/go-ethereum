@@ -17,82 +17,82 @@
 package les
 
 import (
-	"sync"
+	"context"
+	"math/rand"
+	"sort"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common/mclock"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/light"
-	"github.com/ethereum/go-ethereum/logger"
-	"github.com/ethereum/go-ethereum/logger/glog"
-	"golang.org/x/net/context"
 )
 
-var (
-	softRequestTimeout = time.Millisecond * 500
-	hardRequestTimeout = time.Second * 10
-	retryPeers         = time.Second * 1
-)
-
-// peerDropFn is a callback type for dropping a peer detected as malicious.
-type peerDropFn func(id string)
-
+// LesOdr implements light.OdrBackend
 type LesOdr struct {
-	light.OdrBackend
-	db           ethdb.Database
-	stop         chan struct{}
-	removePeer   peerDropFn
-	mlock, clock sync.Mutex
-	sentReqs     map[uint64]*sentReq
-	peers        *odrPeerSet
-	lastReqID    uint64
+	db                                         ethdb.Database
+	indexerConfig                              *light.IndexerConfig
+	chtIndexer, bloomTrieIndexer, bloomIndexer *core.ChainIndexer
+	peers                                      *serverPeerSet
+	retriever                                  *retrieveManager
+	stop                                       chan struct{}
 }
 
-func NewLesOdr(db ethdb.Database) *LesOdr {
+func NewLesOdr(db ethdb.Database, config *light.IndexerConfig, peers *serverPeerSet, retriever *retrieveManager) *LesOdr {
 	return &LesOdr{
-		db:       db,
-		stop:     make(chan struct{}),
-		peers:    newOdrPeerSet(),
-		sentReqs: make(map[uint64]*sentReq),
+		db:            db,
+		indexerConfig: config,
+		peers:         peers,
+		retriever:     retriever,
+		stop:          make(chan struct{}),
 	}
 }
 
+// Stop cancels all pending retrievals
 func (odr *LesOdr) Stop() {
 	close(odr.stop)
 }
 
+// Database returns the backing database
 func (odr *LesOdr) Database() ethdb.Database {
 	return odr.db
 }
 
-// validatorFunc is a function that processes a message and returns true if
-// it was a meaningful answer to a given request
-type validatorFunc func(ethdb.Database, *Msg) bool
-
-// sentReq is a request waiting for an answer that satisfies its valFunc
-type sentReq struct {
-	valFunc  validatorFunc
-	sentTo   map[*peer]chan struct{}
-	lock     sync.RWMutex  // protects acces to sentTo
-	answered chan struct{} // closed and set to nil when any peer answers it
+// SetIndexers adds the necessary chain indexers to the ODR backend
+func (odr *LesOdr) SetIndexers(chtIndexer, bloomTrieIndexer, bloomIndexer *core.ChainIndexer) {
+	odr.chtIndexer = chtIndexer
+	odr.bloomTrieIndexer = bloomTrieIndexer
+	odr.bloomIndexer = bloomIndexer
 }
 
-// RegisterPeer registers a new LES peer to the ODR capable peer set
-func (self *LesOdr) RegisterPeer(p *peer) error {
-	return self.peers.register(p)
+// ChtIndexer returns the CHT chain indexer
+func (odr *LesOdr) ChtIndexer() *core.ChainIndexer {
+	return odr.chtIndexer
 }
 
-// UnregisterPeer removes a peer from the ODR capable peer set
-func (self *LesOdr) UnregisterPeer(p *peer) {
-	self.peers.unregister(p)
+// BloomTrieIndexer returns the bloom trie chain indexer
+func (odr *LesOdr) BloomTrieIndexer() *core.ChainIndexer {
+	return odr.bloomTrieIndexer
+}
+
+// BloomIndexer returns the bloombits chain indexer
+func (odr *LesOdr) BloomIndexer() *core.ChainIndexer {
+	return odr.bloomIndexer
+}
+
+// IndexerConfig returns the indexer config.
+func (odr *LesOdr) IndexerConfig() *light.IndexerConfig {
+	return odr.indexerConfig
 }
 
 const (
-	MsgBlockBodies = iota
+	MsgBlockHeaders = iota
+	MsgBlockBodies
 	MsgCode
 	MsgReceipts
-	MsgProofs
-	MsgHeaderProofs
+	MsgProofsV2
+	MsgHelperTrieProofs
+	MsgTxStatus
 )
 
 // Msg encodes a LES message that delivers reply data for a request
@@ -102,147 +102,135 @@ type Msg struct {
 	Obj     interface{}
 }
 
-// Deliver is called by the LES protocol manager to deliver ODR reply messages to waiting requests
-func (self *LesOdr) Deliver(peer *peer, msg *Msg) error {
-	var delivered chan struct{}
-	self.mlock.Lock()
-	req, ok := self.sentReqs[msg.ReqID]
-	self.mlock.Unlock()
-	if ok {
-		req.lock.Lock()
-		delivered, ok = req.sentTo[peer]
-		req.lock.Unlock()
-	}
+// peerByTxHistory is a heap.Interface implementation which can sort
+// the peerset by transaction history.
+type peerByTxHistory []*serverPeer
 
-	if !ok {
-		return errResp(ErrUnexpectedResponse, "reqID = %v", msg.ReqID)
+func (h peerByTxHistory) Len() int { return len(h) }
+func (h peerByTxHistory) Less(i, j int) bool {
+	if h[i].txHistory == txIndexUnlimited {
+		return false
 	}
-
-	if req.valFunc(self.db, msg) {
-		close(delivered)
-		req.lock.Lock()
-		if req.answered != nil {
-			close(req.answered)
-			req.answered = nil
-		}
-		req.lock.Unlock()
-		return nil
+	if h[j].txHistory == txIndexUnlimited {
+		return true
 	}
-	return errResp(ErrInvalidResponse, "reqID = %v", msg.ReqID)
+	return h[i].txHistory < h[j].txHistory
 }
+func (h peerByTxHistory) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
-func (self *LesOdr) requestPeer(req *sentReq, peer *peer, delivered, timeout chan struct{}, reqWg *sync.WaitGroup) {
-	stime := mclock.Now()
-	defer func() {
-		req.lock.Lock()
-		delete(req.sentTo, peer)
-		req.lock.Unlock()
-		reqWg.Done()
-	}()
+const (
+	maxTxStatusRetry      = 3 // The maximum retrys will be made for tx status request.
+	maxTxStatusCandidates = 5 // The maximum les servers the tx status requests will be sent to.
+)
 
-	select {
-	case <-delivered:
-		servTime := uint64(mclock.Now() - stime)
-		self.peers.updateTimeout(peer, false)
-		self.peers.updateServTime(peer, servTime)
-		return
-	case <-time.After(softRequestTimeout):
-		close(timeout)
-		if self.peers.updateTimeout(peer, true) {
-			self.removePeer(peer.id)
+// RetrieveTxStatus retrieves the transaction status from the LES network.
+// There is no guarantee in the LES protocol that the mined transaction will
+// be retrieved back for sure because of different reasons(the transaction
+// is unindexed, the malicous server doesn't reply it deliberately, etc).
+// Therefore, unretrieved transactions(UNKNOWN) will receive a certain number
+// of retries, thus giving a weak guarantee.
+func (odr *LesOdr) RetrieveTxStatus(ctx context.Context, req *light.TxStatusRequest) error {
+	// Sort according to the transaction history supported by the peer and
+	// select the peers with longest history.
+	var (
+		retries int
+		peers   []*serverPeer
+		missing = len(req.Hashes)
+		result  = make([]light.TxStatus, len(req.Hashes))
+		canSend = make(map[string]bool)
+	)
+	for _, peer := range odr.peers.allPeers() {
+		if peer.txHistory == txIndexDisabled {
+			continue
 		}
-	case <-self.stop:
-		return
+		peers = append(peers, peer)
 	}
-
-	select {
-	case <-delivered:
-		servTime := uint64(mclock.Now() - stime)
-		self.peers.updateServTime(peer, servTime)
-		return
-	case <-time.After(hardRequestTimeout):
-		self.removePeer(peer.id)
-	case <-self.stop:
-		return
+	sort.Sort(sort.Reverse(peerByTxHistory(peers)))
+	for i := 0; i < maxTxStatusCandidates && i < len(peers); i++ {
+		canSend[peers[i].id] = true
 	}
-}
-
-// networkRequest sends a request to known peers until an answer is received
-// or the context is cancelled
-func (self *LesOdr) networkRequest(ctx context.Context, lreq LesOdrRequest) error {
-	answered := make(chan struct{})
-	req := &sentReq{
-		valFunc:  lreq.Valid,
-		sentTo:   make(map[*peer]chan struct{}),
-		answered: answered, // reply delivered by any peer
-	}
-	reqID := self.getNextReqID()
-	self.mlock.Lock()
-	self.sentReqs[reqID] = req
-	self.mlock.Unlock()
-
-	reqWg := new(sync.WaitGroup)
-	reqWg.Add(1)
-	defer reqWg.Done()
-	go func() {
-		reqWg.Wait()
-		self.mlock.Lock()
-		delete(self.sentReqs, reqID)
-		self.mlock.Unlock()
-	}()
-
-	exclude := make(map[*peer]struct{})
+	// Send out the request and assemble the result.
 	for {
-		if peer := self.peers.bestPeer(lreq, exclude); peer == nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-req.answered:
-				return nil
-			case <-time.After(retryPeers):
-			}
-		} else {
-			exclude[peer] = struct{}{}
-			delivered := make(chan struct{})
-			timeout := make(chan struct{})
-			req.lock.Lock()
-			req.sentTo[peer] = delivered
-			req.lock.Unlock()
-			reqWg.Add(1)
-			cost := lreq.GetCost(peer)
-			peer.fcServer.SendRequest(reqID, cost)
-			go self.requestPeer(req, peer, delivered, timeout, reqWg)
-			lreq.Request(reqID, peer)
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-answered:
-				return nil
-			case <-timeout:
-			}
+		if retries >= maxTxStatusRetry || len(canSend) == 0 {
+			break
 		}
+		var (
+			// Deep copy the request, so that the partial result won't be mixed.
+			req     = &TxStatusRequest{Hashes: req.Hashes}
+			id      = rand.Uint64()
+			distreq = &distReq{
+				getCost: func(dp distPeer) uint64 { return req.GetCost(dp.(*serverPeer)) },
+				canSend: func(dp distPeer) bool { return canSend[dp.(*serverPeer).id] },
+				request: func(dp distPeer) func() {
+					p := dp.(*serverPeer)
+					p.fcServer.QueuedRequest(id, req.GetCost(p))
+					delete(canSend, p.id)
+					return func() { req.Request(id, p) }
+				},
+			}
+		)
+		if err := odr.retriever.retrieve(ctx, id, distreq, func(p distPeer, msg *Msg) error { return req.Validate(odr.db, msg) }, odr.stop); err != nil {
+			return err
+		}
+		// Collect the response and assemble them to the final result.
+		// All the response is not verifiable, so always pick the first
+		// one we get.
+		for index, status := range req.Status {
+			if result[index].Status != core.TxStatusUnknown {
+				continue
+			}
+			if status.Status == core.TxStatusUnknown {
+				continue
+			}
+			result[index], missing = status, missing-1
+		}
+		// Abort the procedure if all the status are retrieved
+		if missing == 0 {
+			break
+		}
+		retries += 1
 	}
+	req.Status = result
+	return nil
 }
 
-// Retrieve tries to fetch an object from the local db, then from the LES network.
+// Retrieve tries to fetch an object from the LES network. It's a common API
+// for most of the LES requests except for the TxStatusRequest which needs
+// the additional retry mechanism.
 // If the network retrieval was successful, it stores the object in local db.
-func (self *LesOdr) Retrieve(ctx context.Context, req light.OdrRequest) (err error) {
+func (odr *LesOdr) Retrieve(ctx context.Context, req light.OdrRequest) (err error) {
 	lreq := LesRequest(req)
-	err = self.networkRequest(ctx, lreq)
-	if err == nil {
-		// retrieved from network, store in db
-		req.StoreResult(self.db)
-	} else {
-		glog.V(logger.Debug).Infof("networkRequest  err = %v", err)
+
+	reqID := rand.Uint64()
+	rq := &distReq{
+		getCost: func(dp distPeer) uint64 {
+			return lreq.GetCost(dp.(*serverPeer))
+		},
+		canSend: func(dp distPeer) bool {
+			p := dp.(*serverPeer)
+			if !p.onlyAnnounce {
+				return lreq.CanSend(p)
+			}
+			return false
+		},
+		request: func(dp distPeer) func() {
+			p := dp.(*serverPeer)
+			cost := lreq.GetCost(p)
+			p.fcServer.QueuedRequest(reqID, cost)
+			return func() { lreq.Request(reqID, p) }
+		},
 	}
-	return
-}
 
-func (self *LesOdr) getNextReqID() uint64 {
-	self.clock.Lock()
-	defer self.clock.Unlock()
+	defer func(sent mclock.AbsTime) {
+		if err != nil {
+			return
+		}
+		requestRTT.Update(time.Duration(mclock.Now() - sent))
+	}(mclock.Now())
 
-	self.lastReqID++
-	return self.lastReqID
+	if err := odr.retriever.retrieve(ctx, reqID, rq, func(p distPeer, msg *Msg) error { return lreq.Validate(odr.db, msg) }, odr.stop); err != nil {
+		return err
+	}
+	req.StoreResult(odr.db)
+	return nil
 }

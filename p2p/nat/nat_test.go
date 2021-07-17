@@ -17,7 +17,6 @@
 package nat
 
 import (
-	"bytes"
 	"net"
 	"testing"
 	"time"
@@ -29,7 +28,7 @@ import (
 func TestAutoDiscRace(t *testing.T) {
 	ad := startautodisc("thing", func() Interface {
 		time.Sleep(500 * time.Millisecond)
-		return extIP{33, 44, 55, 66}
+		return ExtIP{33, 44, 55, 66}
 	})
 
 	// Spawn a few concurrent calls to ad.ExternalIP.
@@ -56,7 +55,7 @@ func TestAutoDiscRace(t *testing.T) {
 				t.Errorf("result %d: unexpected error: %v", i, rval.err)
 			}
 			wantIP := net.IP{33, 44, 55, 66}
-			if !bytes.Equal(rval.ip, wantIP) {
+			if !rval.ip.Equal(wantIP) {
 				t.Errorf("result %d: got IP %v, want %v", i, rval.ip, wantIP)
 			}
 		}

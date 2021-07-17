@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/p2p"
 )
 
 // Tests that datadirs can be successfully created, be them manually configured
@@ -37,13 +38,21 @@ func TestDatadirCreation(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 
-	if _, err := New(&Config{DataDir: dir}); err != nil {
+	node, err := New(&Config{DataDir: dir})
+	if err != nil {
 		t.Fatalf("failed to create stack with existing datadir: %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("failed to close node: %v", err)
 	}
 	// Generate a long non-existing datadir path and check that it gets created by a node
 	dir = filepath.Join(dir, "a", "b", "c", "d", "e", "f")
-	if _, err := New(&Config{DataDir: dir}); err != nil {
+	node, err = New(&Config{DataDir: dir})
+	if err != nil {
 		t.Fatalf("failed to create stack with creatable datadir: %v", err)
+	}
+	if err := node.Close(); err != nil {
+		t.Fatalf("failed to close node: %v", err)
 	}
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("freshly created datadir not accessible: %v", err)
@@ -56,8 +65,12 @@ func TestDatadirCreation(t *testing.T) {
 	defer os.Remove(file.Name())
 
 	dir = filepath.Join(file.Name(), "invalid/path")
-	if _, err := New(&Config{DataDir: dir}); err == nil {
+	node, err = New(&Config{DataDir: dir})
+	if err == nil {
 		t.Fatalf("protocol stack created with an invalid datadir")
+		if err := node.Close(); err != nil {
+			t.Fatalf("failed to close node: %v", err)
+		}
 	}
 }
 
@@ -109,7 +122,7 @@ func TestNodeKeyPersistency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to generate one-shot node key: %v", err)
 	}
-	config := &Config{Name: "unit-test", DataDir: dir, PrivateKey: key}
+	config := &Config{Name: "unit-test", DataDir: dir, P2P: p2p.Config{PrivateKey: key}}
 	config.NodeKey()
 	if _, err := os.Stat(filepath.Join(keyfile)); err == nil {
 		t.Fatalf("one-shot node key persisted to data directory")
@@ -121,8 +134,7 @@ func TestNodeKeyPersistency(t *testing.T) {
 	if _, err := os.Stat(keyfile); err != nil {
 		t.Fatalf("node key not persisted to data directory: %v", err)
 	}
-	key, err = crypto.LoadECDSA(keyfile)
-	if err != nil {
+	if _, err = crypto.LoadECDSA(keyfile); err != nil {
 		t.Fatalf("failed to load freshly persisted node key: %v", err)
 	}
 	blob1, err := ioutil.ReadFile(keyfile)
@@ -137,7 +149,7 @@ func TestNodeKeyPersistency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read previously persisted node key: %v", err)
 	}
-	if bytes.Compare(blob1, blob2) != 0 {
+	if !bytes.Equal(blob1, blob2) {
 		t.Fatalf("persisted node key mismatch: have %x, want %x", blob2, blob1)
 	}
 

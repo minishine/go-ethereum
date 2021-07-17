@@ -11,7 +11,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 // GNU Lesser General Public License for more details.
 //
-// You should have received s copy of the GNU Lesser General Public License
+// You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
 // Contains various wrappers for primitive types.
@@ -21,6 +21,8 @@ package geth
 import (
 	"errors"
 	"fmt"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 // Strings represents s slice of strs.
@@ -32,7 +34,7 @@ func (s *Strings) Size() int {
 }
 
 // Get returns the string at the given index from the slice.
-func (s *Strings) Get(index int) (string, error) {
+func (s *Strings) Get(index int) (str string, _ error) {
 	if index < 0 || index >= len(s.strs) {
 		return "", errors.New("index out of bounds")
 	}
@@ -51,4 +53,64 @@ func (s *Strings) Set(index int, str string) error {
 // String implements the Stringer interface.
 func (s *Strings) String() string {
 	return fmt.Sprintf("%v", s.strs)
+}
+
+// Bools represents a slice of bool.
+type Bools struct{ bools []bool }
+
+// Size returns the number of bool in the slice.
+func (bs *Bools) Size() int {
+	return len(bs.bools)
+}
+
+// Get returns the bool at the given index from the slice.
+func (bs *Bools) Get(index int) (b bool, _ error) {
+	if index < 0 || index >= len(bs.bools) {
+		return false, errors.New("index out of bounds")
+	}
+	return bs.bools[index], nil
+}
+
+// Set sets the bool at the given index in the slice.
+func (bs *Bools) Set(index int, b bool) error {
+	if index < 0 || index >= len(bs.bools) {
+		return errors.New("index out of bounds")
+	}
+	bs.bools[index] = b
+	return nil
+}
+
+// String implements the Stringer interface.
+func (bs *Bools) String() string {
+	return fmt.Sprintf("%v", bs.bools)
+}
+
+// Binaries represents a slice of byte slice
+type Binaries struct{ binaries [][]byte }
+
+// Size returns the number of byte slice in the slice.
+func (bs *Binaries) Size() int {
+	return len(bs.binaries)
+}
+
+// Get returns the byte slice at the given index from the slice.
+func (bs *Binaries) Get(index int) (binary []byte, _ error) {
+	if index < 0 || index >= len(bs.binaries) {
+		return nil, errors.New("index out of bounds")
+	}
+	return common.CopyBytes(bs.binaries[index]), nil
+}
+
+// Set sets the byte slice at the given index in the slice.
+func (bs *Binaries) Set(index int, binary []byte) error {
+	if index < 0 || index >= len(bs.binaries) {
+		return errors.New("index out of bounds")
+	}
+	bs.binaries[index] = common.CopyBytes(binary)
+	return nil
+}
+
+// String implements the Stringer interface.
+func (bs *Binaries) String() string {
+	return fmt.Sprintf("%v", bs.binaries)
 }

@@ -28,8 +28,9 @@ import (
 func TestNodeIteratorCoverage(t *testing.T) {
 	// Create some arbitrary test state to iterate
 	db, root, _ := makeTestState()
+	db.TrieDB().Commit(root, false, nil)
 
-	state, err := New(root, db)
+	state, err := New(root, db, nil)
 	if err != nil {
 		t.Fatalf("failed to create state trie at %x: %v", root, err)
 	}
@@ -40,13 +41,23 @@ func TestNodeIteratorCoverage(t *testing.T) {
 			hashes[it.Hash] = struct{}{}
 		}
 	}
-	// Cross check the hashes and the database itself
-	for hash, _ := range hashes {
-		if _, err := db.Get(hash.Bytes()); err != nil {
-			t.Errorf("failed to retrieve reported node %x: %v", hash, err)
+	// Cross check the iterated hashes and the database/nodepool content
+	for hash := range hashes {
+		if _, err = db.TrieDB().Node(hash); err != nil {
+			_, err = db.ContractCode(common.Hash{}, hash)
+		}
+		if err != nil {
+			t.Errorf("failed to retrieve reported node %x", hash)
 		}
 	}
-	for _, key := range db.(*ethdb.MemDatabase).Keys() {
+	for _, hash := range db.TrieDB().Nodes() {
+		if _, ok := hashes[hash]; !ok {
+			t.Errorf("state entry not reported %x", hash)
+		}
+	}
+	it := db.TrieDB().DiskDB().(ethdb.Database).NewIterator(nil, nil)
+	for it.Next() {
+		key := it.Key()
 		if bytes.HasPrefix(key, []byte("secure-key-")) {
 			continue
 		}
@@ -54,4 +65,5 @@ func TestNodeIteratorCoverage(t *testing.T) {
 			t.Errorf("state entry not reported %x", key)
 		}
 	}
+	it.Release()
 }

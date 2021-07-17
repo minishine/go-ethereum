@@ -24,8 +24,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -40,7 +39,9 @@ var daoOldGenesis = `{
 	"mixhash"    : "0x0000000000000000000000000000000000000000000000000000000000000000",
 	"parentHash" : "0x0000000000000000000000000000000000000000000000000000000000000000",
 	"timestamp"  : "0x00",
-	"config"     : {}
+	"config"     : {
+		"homesteadBlock" : 0
+	}
 }`
 
 // Genesis block for nodes which actively oppose the DAO fork
@@ -55,6 +56,7 @@ var daoNoForkGenesis = `{
 	"parentHash" : "0x0000000000000000000000000000000000000000000000000000000000000000",
 	"timestamp"  : "0x00",
 	"config"     : {
+		"homesteadBlock" : 0,
 		"daoForkBlock"   : 314,
 		"daoForkSupport" : false
 	}
@@ -72,6 +74,7 @@ var daoProForkGenesis = `{
 	"parentHash" : "0x0000000000000000000000000000000000000000000000000000000000000000",
 	"timestamp"  : "0x00",
 	"config"     : {
+		"homesteadBlock" : 0,
 		"daoForkBlock"   : 314,
 		"daoForkSupport" : true
 	}
@@ -83,75 +86,25 @@ var daoGenesisForkBlock = big.NewInt(314)
 // TestDAOForkBlockNewChain tests that the DAO hard-fork number and the nodes support/opposition is correctly
 // set in the database after various initialization procedures and invocations.
 func TestDAOForkBlockNewChain(t *testing.T) {
-	for _, arg := range []struct {
-		testnet     bool
+	for i, arg := range []struct {
 		genesis     string
-		votes       [][2]bool
 		expectBlock *big.Int
 		expectVote  bool
 	}{
 		// Test DAO Default Mainnet
-		{false, "", [][2]bool{{false, false}}, params.MainNetDAOForkBlock, true},
-		// test DAO Support Mainnet
-		{false, "", [][2]bool{{true, false}}, params.MainNetDAOForkBlock, true},
-		// test DAO Oppose Mainnet
-		{false, "", [][2]bool{{false, true}}, params.MainNetDAOForkBlock, false},
-		// test DAO Switch To Support Mainnet
-		{false, "", [][2]bool{{false, true}, {true, false}}, params.MainNetDAOForkBlock, true},
-		// test DAO Switch To Oppose Mainnet
-		{false, "", [][2]bool{{true, false}, {false, true}}, params.MainNetDAOForkBlock, false},
-		// test DAO Default Testnet
-		{true, "", [][2]bool{{false, false}}, params.TestNetDAOForkBlock, true},
-		// test DAO Support Testnet
-		{true, "", [][2]bool{{true, false}}, params.TestNetDAOForkBlock, true},
-		// test DAO Oppose Testnet
-		{true, "", [][2]bool{{false, true}}, params.TestNetDAOForkBlock, false},
-		// test DAO Switch To Support Testnet
-		{true, "", [][2]bool{{false, true}, {true, false}}, params.TestNetDAOForkBlock, true},
-		// test DAO Switch To Oppose Testnet
-		{true, "", [][2]bool{{true, false}, {false, true}}, params.TestNetDAOForkBlock, false},
+		{"", params.MainnetChainConfig.DAOForkBlock, true},
 		// test DAO Init Old Privnet
-		{false, daoOldGenesis, [][2]bool{}, nil, false},
-		// test DAO Default Old Privnet
-		{false, daoOldGenesis, [][2]bool{{false, false}}, nil, false},
-		// test DAO Support Old Privnet
-		{false, daoOldGenesis, [][2]bool{{true, false}}, nil, true},
-		// test DAO Oppose Old Privnet
-		{false, daoOldGenesis, [][2]bool{{false, true}}, nil, false},
-		// test DAO Switch To Support Old Privnet
-		{false, daoOldGenesis, [][2]bool{{false, true}, {true, false}}, nil, true},
-		// test DAO Switch To Oppose Old Privnet
-		{false, daoOldGenesis, [][2]bool{{true, false}, {false, true}}, nil, false},
-		// test DAO Init No Fork Privnet
-		{false, daoNoForkGenesis, [][2]bool{}, daoGenesisForkBlock, false},
+		{daoOldGenesis, nil, false},
 		// test DAO Default No Fork Privnet
-		{false, daoNoForkGenesis, [][2]bool{{false, false}}, daoGenesisForkBlock, false},
-		// test DAO Support No Fork Privnet
-		{false, daoNoForkGenesis, [][2]bool{{true, false}}, daoGenesisForkBlock, true},
-		// test DAO Oppose No Fork Privnet
-		{false, daoNoForkGenesis, [][2]bool{{false, true}}, daoGenesisForkBlock, false},
-		// test DAO Switch To Support No Fork Privnet
-		{false, daoNoForkGenesis, [][2]bool{{false, true}, {true, false}}, daoGenesisForkBlock, true},
-		// test DAO Switch To Oppose No Fork Privnet
-		{false, daoNoForkGenesis, [][2]bool{{true, false}, {false, true}}, daoGenesisForkBlock, false},
-		// test DAO Init Pro Fork Privnet
-		{false, daoProForkGenesis, [][2]bool{}, daoGenesisForkBlock, true},
+		{daoNoForkGenesis, daoGenesisForkBlock, false},
 		// test DAO Default Pro Fork Privnet
-		{false, daoProForkGenesis, [][2]bool{{false, false}}, daoGenesisForkBlock, true},
-		// test DAO Support Pro Fork Privnet
-		{false, daoProForkGenesis, [][2]bool{{true, false}}, daoGenesisForkBlock, true},
-		// test DAO Oppose Pro Fork Privnet
-		{false, daoProForkGenesis, [][2]bool{{false, true}}, daoGenesisForkBlock, false},
-		// test DAO Switch To Support Pro Fork Privnet
-		{false, daoProForkGenesis, [][2]bool{{false, true}, {true, false}}, daoGenesisForkBlock, true},
-		// test DAO Switch To Oppose Pro Fork Privnet
-		{false, daoProForkGenesis, [][2]bool{{true, false}, {false, true}}, daoGenesisForkBlock, false},
+		{daoProForkGenesis, daoGenesisForkBlock, true},
 	} {
-		testDAOForkBlockNewChain(t, arg.testnet, arg.genesis, arg.votes, arg.expectBlock, arg.expectVote)
+		testDAOForkBlockNewChain(t, i, arg.genesis, arg.expectBlock, arg.expectVote)
 	}
 }
 
-func testDAOForkBlockNewChain(t *testing.T, testnet bool, genesis string, votes [][2]bool, expectBlock *big.Int, expectVote bool) {
+func testDAOForkBlockNewChain(t *testing.T, test int, genesis string, expectBlock *big.Int, expectVote bool) {
 	// Create a temporary data directory to use and inspect later
 	datadir := tmpdir(t)
 	defer os.RemoveAll(datadir)
@@ -160,57 +113,42 @@ func testDAOForkBlockNewChain(t *testing.T, testnet bool, genesis string, votes 
 	if genesis != "" {
 		json := filepath.Join(datadir, "genesis.json")
 		if err := ioutil.WriteFile(json, []byte(genesis), 0600); err != nil {
-			t.Fatalf("failed to write genesis file: %v", err)
+			t.Fatalf("test %d: failed to write genesis file: %v", test, err)
 		}
-		runGeth(t, "--datadir", datadir, "init", json).cmd.Wait()
-	}
-	for _, vote := range votes {
-		args := []string{"--port", "0", "--maxpeers", "0", "--nodiscover", "--nat", "none", "--ipcdisable", "--datadir", datadir}
-		if testnet {
-			args = append(args, "--testnet")
-		}
-		if vote[0] {
-			args = append(args, "--support-dao-fork")
-		}
-		if vote[1] {
-			args = append(args, "--oppose-dao-fork")
-		}
-		geth := runGeth(t, append(args, []string{"--exec", "2+2", "console"}...)...)
-		geth.cmd.Wait()
+		runGeth(t, "--datadir", datadir, "--networkid", "1337", "init", json).WaitExit()
+	} else {
+		// Force chain initialization
+		args := []string{"--port", "0", "--networkid", "1337", "--maxpeers", "0", "--nodiscover", "--nat", "none", "--ipcdisable", "--datadir", datadir}
+		runGeth(t, append(args, []string{"--exec", "2+2", "console"}...)...).WaitExit()
 	}
 	// Retrieve the DAO config flag from the database
 	path := filepath.Join(datadir, "geth", "chaindata")
-	if testnet && genesis == "" {
-		path = filepath.Join(datadir, "testnet", "geth", "chaindata")
-	}
-	db, err := ethdb.NewLDBDatabase(path, 0, 0)
+	db, err := rawdb.NewLevelDBDatabase(path, 0, 0, "", false)
 	if err != nil {
-		t.Fatalf("failed to open test database: %v", err)
+		t.Fatalf("test %d: failed to open test database: %v", test, err)
 	}
 	defer db.Close()
 
 	genesisHash := common.HexToHash("0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3")
-	if testnet {
-		genesisHash = common.HexToHash("0x0cd786a2425d16f152c658316c423e6ce1181e15c3295826d7c9904cba9ce303")
-	}
 	if genesis != "" {
 		genesisHash = daoGenesisHash
 	}
-	config, err := core.GetChainConfig(db, genesisHash)
-	if err != nil {
-		t.Fatalf("failed to retrieve chain config: %v", err)
+	config := rawdb.ReadChainConfig(db, genesisHash)
+	if config == nil {
+		t.Errorf("test %d: failed to retrieve chain config: %v", test, err)
+		return // we want to return here, the other checks can't make it past this point (nil panic).
 	}
 	// Validate the DAO hard-fork block number against the expected value
 	if config.DAOForkBlock == nil {
 		if expectBlock != nil {
-			t.Errorf("dao hard-fork block mismatch: have nil, want %v", expectBlock)
+			t.Errorf("test %d: dao hard-fork block mismatch: have nil, want %v", test, expectBlock)
 		}
 	} else if expectBlock == nil {
-		t.Errorf("dao hard-fork block mismatch: have %v, want nil", config.DAOForkBlock)
+		t.Errorf("test %d: dao hard-fork block mismatch: have %v, want nil", test, config.DAOForkBlock)
 	} else if config.DAOForkBlock.Cmp(expectBlock) != 0 {
-		t.Errorf("dao hard-fork block mismatch: have %v, want %v", config.DAOForkBlock, expectBlock)
+		t.Errorf("test %d: dao hard-fork block mismatch: have %v, want %v", test, config.DAOForkBlock, expectBlock)
 	}
 	if config.DAOForkSupport != expectVote {
-		t.Errorf("dao hard-fork support mismatch: have %v, want %v", config.DAOForkSupport, expectVote)
+		t.Errorf("test %d: dao hard-fork support mismatch: have %v, want %v", test, config.DAOForkSupport, expectVote)
 	}
 }

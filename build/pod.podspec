@@ -1,5 +1,5 @@
 Pod::Spec.new do |spec|
-  spec.name         = '{{.Name}}'
+  spec.name         = 'Geth'
   spec.version      = '{{.Version}}'
   spec.license      = { :type => 'GNU Lesser General Public License, Version 3.0' }
   spec.homepage     = 'https://github.com/ethereum/go-ethereum'
@@ -14,9 +14,9 @@ Pod::Spec.new do |spec|
 	spec.ios.vendored_frameworks = 'Frameworks/Geth.framework'
 
 	spec.prepare_command = <<-CMD
-    curl https://gethstore.blob.core.windows.net/builds/geth-ios-all-{{.Version}}.tar.gz | tar -xvz
+    curl https://gethstore.blob.core.windows.net/builds/{{.Archive}}.tar.gz | tar -xvz
     mkdir Frameworks
-    mv geth-ios-all-{{.Version}}/Geth.framework Frameworks
-    rm -rf geth-ios-all-{{.Version}}
+    mv {{.Archive}}/Geth.framework Frameworks
+    rm -rf {{.Archive}}
   CMD
 end

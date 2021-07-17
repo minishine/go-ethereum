@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 )
 
 // Hash represents the 32 byte Keccak256 hash of arbitrary data.
@@ -33,18 +34,18 @@ type Hash struct {
 }
 
 // NewHashFromBytes converts a slice of bytes to a hash value.
-func NewHashFromBytes(hash []byte) (*Hash, error) {
+func NewHashFromBytes(binary []byte) (hash *Hash, _ error) {
 	h := new(Hash)
-	if err := h.SetBytes(hash); err != nil {
+	if err := h.SetBytes(common.CopyBytes(binary)); err != nil {
 		return nil, err
 	}
 	return h, nil
 }
 
 // NewHashFromHex converts a hex string to a hash value.
-func NewHashFromHex(hash string) (*Hash, error) {
+func NewHashFromHex(hex string) (hash *Hash, _ error) {
 	h := new(Hash)
-	if err := h.SetHex(hash); err != nil {
+	if err := h.SetHex(hex); err != nil {
 		return nil, err
 	}
 	return h, nil
@@ -86,8 +87,25 @@ func (h *Hash) GetHex() string {
 	return h.hash.Hex()
 }
 
+// String implements Stringer interface for printable representation of the hash.
+func (h *Hash) String() string {
+	return h.GetHex()
+}
+
 // Hashes represents a slice of hashes.
 type Hashes struct{ hashes []common.Hash }
+
+// NewHashes creates a slice of uninitialized Hashes.
+func NewHashes(size int) *Hashes {
+	return &Hashes{
+		hashes: make([]common.Hash, size),
+	}
+}
+
+// NewHashesEmpty creates an empty slice of Hashes values.
+func NewHashesEmpty() *Hashes {
+	return NewHashes(0)
+}
 
 // Size returns the number of hashes in the slice.
 func (h *Hashes) Size() int {
@@ -95,11 +113,25 @@ func (h *Hashes) Size() int {
 }
 
 // Get returns the hash at the given index from the slice.
-func (h *Hashes) Get(index int) (*Hash, error) {
+func (h *Hashes) Get(index int) (hash *Hash, _ error) {
 	if index < 0 || index >= len(h.hashes) {
 		return nil, errors.New("index out of bounds")
 	}
 	return &Hash{h.hashes[index]}, nil
+}
+
+// Set sets the Hash at the given index in the slice.
+func (h *Hashes) Set(index int, hash *Hash) error {
+	if index < 0 || index >= len(h.hashes) {
+		return errors.New("index out of bounds")
+	}
+	h.hashes[index] = hash.hash
+	return nil
+}
+
+// Append adds a new Hash element to the end of the slice.
+func (h *Hashes) Append(hash *Hash) {
+	h.hashes = append(h.hashes, hash.hash)
 }
 
 // Address represents the 20 byte address of an Ethereum account.
@@ -108,18 +140,18 @@ type Address struct {
 }
 
 // NewAddressFromBytes converts a slice of bytes to a hash value.
-func NewAddressFromBytes(address []byte) (*Address, error) {
+func NewAddressFromBytes(binary []byte) (address *Address, _ error) {
 	a := new(Address)
-	if err := a.SetBytes(address); err != nil {
+	if err := a.SetBytes(common.CopyBytes(binary)); err != nil {
 		return nil, err
 	}
 	return a, nil
 }
 
 // NewAddressFromHex converts a hex string to a address value.
-func NewAddressFromHex(address string) (*Address, error) {
+func NewAddressFromHex(hex string) (address *Address, _ error) {
 	a := new(Address)
-	if err := a.SetHex(address); err != nil {
+	if err := a.SetHex(hex); err != nil {
 		return nil, err
 	}
 	return a, nil
@@ -161,8 +193,25 @@ func (a *Address) GetHex() string {
 	return a.address.Hex()
 }
 
+// String returns a printable representation of the address.
+func (a *Address) String() string {
+	return a.GetHex()
+}
+
 // Addresses represents a slice of addresses.
 type Addresses struct{ addresses []common.Address }
+
+// NewAddresses creates a slice of uninitialized addresses.
+func NewAddresses(size int) *Addresses {
+	return &Addresses{
+		addresses: make([]common.Address, size),
+	}
+}
+
+// NewAddressesEmpty creates an empty slice of Addresses values.
+func NewAddressesEmpty() *Addresses {
+	return NewAddresses(0)
+}
 
 // Size returns the number of addresses in the slice.
 func (a *Addresses) Size() int {
@@ -170,7 +219,7 @@ func (a *Addresses) Size() int {
 }
 
 // Get returns the address at the given index from the slice.
-func (a *Addresses) Get(index int) (*Address, error) {
+func (a *Addresses) Get(index int) (address *Address, _ error) {
 	if index < 0 || index >= len(a.addresses) {
 		return nil, errors.New("index out of bounds")
 	}
@@ -184,4 +233,19 @@ func (a *Addresses) Set(index int, address *Address) error {
 	}
 	a.addresses[index] = address.address
 	return nil
+}
+
+// Append adds a new address element to the end of the slice.
+func (a *Addresses) Append(address *Address) {
+	a.addresses = append(a.addresses, address.address)
+}
+
+// EncodeToHex encodes b as a hex string with 0x prefix.
+func EncodeToHex(b []byte) string {
+	return hexutil.Encode(b)
+}
+
+// DecodeFromHex decodes a hex string with 0x prefix.
+func DecodeFromHex(s string) ([]byte, error) {
+	return hexutil.Decode(s)
 }

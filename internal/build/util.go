@@ -20,11 +20,14 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"text/template"
@@ -49,32 +52,7 @@ func MustRunCommand(cmd string, args ...string) {
 	MustRun(exec.Command(cmd, args...))
 }
 
-// GOPATH returns the value that the GOPATH environment
-// variable should be set to.
-func GOPATH() string {
-	path := filepath.SplitList(os.Getenv("GOPATH"))
-	if len(path) == 0 {
-		log.Fatal("GOPATH is not set")
-	}
-	// Ensure that our internal vendor folder is on GOPATH
-	vendor, _ := filepath.Abs(filepath.Join("build", "_vendor"))
-	for _, dir := range path {
-		if dir == vendor {
-			return strings.Join(path, string(filepath.ListSeparator))
-		}
-	}
-	newpath := append(path[:1], append([]string{vendor}, path[1:]...)...)
-	return strings.Join(newpath, string(filepath.ListSeparator))
-}
-
-// VERSION returns the content of the VERSION file.
-func VERSION() string {
-	version, err := ioutil.ReadFile("VERSION")
-	if err != nil {
-		log.Fatal(err)
-	}
-	return string(bytes.TrimSpace(version))
-}
+var warnedAboutGit bool
 
 // RunGit runs a git subcommand and returns its output.
 // The command must complete successfully.
@@ -82,13 +60,26 @@ func RunGit(args ...string) string {
 	cmd := exec.Command("git", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err == exec.ErrNotFound {
-		log.Println("no git in PATH")
-		return ""
-	} else if err != nil {
+	if err := cmd.Run(); err != nil {
+		if e, ok := err.(*exec.Error); ok && e.Err == exec.ErrNotFound {
+			if !warnedAboutGit {
+				log.Println("Warning: can't find 'git' in PATH")
+				warnedAboutGit = true
+			}
+			return ""
+		}
 		log.Fatal(strings.Join(cmd.Args, " "), ": ", err, "\n", stderr.String())
 	}
 	return strings.TrimSpace(stdout.String())
+}
+
+// readGitFile returns content of file in .git directory.
+func readGitFile(file string) string {
+	content, err := ioutil.ReadFile(path.Join(".git", file))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(content))
 }
 
 // Render renders the given template file into outputFile.
@@ -119,24 +110,58 @@ func render(tpl *template.Template, outputFile string, outputPerm os.FileMode, x
 	}
 }
 
-// CopyFile copies a file.
-func CopyFile(dst, src string, mode os.FileMode) {
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		log.Fatal(err)
+// UploadSFTP uploads files to a remote host using the sftp command line tool.
+// The destination host may be specified either as [user@]host[: or as a URI in
+// the form sftp://[user@]host[:port].
+func UploadSFTP(identityFile, host, dir string, files []string) error {
+	sftp := exec.Command("sftp")
+	sftp.Stdout = nil
+	sftp.Stderr = os.Stderr
+	if identityFile != "" {
+		sftp.Args = append(sftp.Args, "-i", identityFile)
 	}
-	destFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	sftp.Args = append(sftp.Args, host)
+	fmt.Println(">>>", strings.Join(sftp.Args, " "))
+	if *DryRunFlag {
+		return nil
+	}
+
+	stdin, err := sftp.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("can't create stdin pipe for sftp: %v", err)
+	}
+	if err := sftp.Start(); err != nil {
+		return err
+	}
+	in := io.MultiWriter(stdin, os.Stdout)
+	for _, f := range files {
+		fmt.Fprintln(in, "put", f, path.Join(dir, filepath.Base(f)))
+	}
+	stdin.Close()
+	return sftp.Wait()
+}
+
+// FindMainPackages finds all 'main' packages in the given directory and returns their
+// package paths.
+func FindMainPackages(dir string) []string {
+	var commands []string
+	cmds, err := ioutil.ReadDir(dir)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer destFile.Close()
-
-	srcFile, err := os.Open(src)
-	if err != nil {
-		log.Fatal(err)
+	for _, cmd := range cmds {
+		pkgdir := filepath.Join(dir, cmd.Name())
+		pkgs, err := parser.ParseDir(token.NewFileSet(), pkgdir, nil, parser.PackageClauseOnly)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for name := range pkgs {
+			if name == "main" {
+				path := "./" + filepath.ToSlash(pkgdir)
+				commands = append(commands, path)
+				break
+			}
+		}
 	}
-	defer srcFile.Close()
-
-	if _, err := io.Copy(destFile, srcFile); err != nil {
-		log.Fatal(err)
-	}
+	return commands
 }
